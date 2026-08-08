@@ -15,6 +15,8 @@ extern const struct kernel_offsets *active_offsets;
 #undef INIT_CRED
 #undef ROOT_TASK_GROUP
 #undef SELINUX_ENFORCING
+#undef CALL_USERMODEHELPER_EXEC_WORK
+#undef SYSTEM_UNBOUND_WQ
 #undef SELINUX_BLOB_SIZES
 #undef SECURITY_HOOK_HEADS
 #undef KMALLOC_CACHES
@@ -42,6 +44,9 @@ extern const struct kernel_offsets *active_offsets;
 #define INIT_CRED           _RSO_IMAGE(off_init_cred, INIT_CRED_OFF)
 #define ROOT_TASK_GROUP     _RSO_IMAGE(off_root_task_group, ROOT_TASK_GROUP_OFF)
 #define SELINUX_ENFORCING   _RSO_IMAGE(off_selinux_enforcing, SELINUX_ENFORCING_OFF)
+#define CALL_USERMODEHELPER_EXEC_WORK \
+  _RSO_IMAGE(off_call_usermodehelper_exec_work, CALL_USERMODEHELPER_EXEC_WORK_OFF)
+#define SYSTEM_UNBOUND_WQ _RSO_IMAGE(off_system_unbound_wq, SYSTEM_UNBOUND_WQ_OFF)
 #define SELINUX_BLOB_SIZES  _RSO_IMAGE(off_selinux_blob_sizes, SELINUX_BLOB_SIZES_OFF)
 #define SECURITY_HOOK_HEADS _RSO_IMAGE(off_security_hook_heads, SECURITY_HOOK_HEADS_OFF)
 #define KMALLOC_CACHES      _RSO_IMAGE(off_kmalloc_caches, KMALLOC_CACHES_OFF)
@@ -69,7 +74,12 @@ extern const struct kernel_offsets *active_offsets;
 #define SLIDE_ROOT_TASK_GROUP_IMAGE \
   _RSO_IMAGE(off_root_task_group, ROOT_TASK_GROUP_OFF)
 #define SLIDE_SYSCTL_BOOTID_IMAGE \
-  _RSO_IMAGE(off_slide_boot_id, SLIDE_SYSCTL_BOOTID_OFF)
+  (KIMAGE_TEXT_BASE + \
+   (active_offsets && active_offsets->off_slide_sysctl_bootid \
+      ? active_offsets->off_slide_sysctl_bootid \
+      : (active_offsets && active_offsets->off_slide_boot_id \
+           ? active_offsets->off_slide_boot_id \
+           : SLIDE_SYSCTL_BOOTID_OFF)))
 
 #undef INIT_TASK_TASKS
 #undef SECURITY_CAPABLE_HEAD
@@ -107,5 +117,54 @@ extern const struct kernel_offsets *active_offsets;
 #define TASK_COMM_OFF            _RSO(task_comm, 0x910)
 #define TASK_TASKS_OFF           _RSO(task_tasks, 0x638)
 #define TASK_SECCOMP_OFF         _RSO(task_seccomp, 0x9C8)
+
+/* Kernel-family base addresses and layouts. */
+#undef KIMAGE_TEXT_BASE
+#undef VMEMMAP_START
+#undef STRUCT_SLAB_CACHE_OFF
+#undef FOPS_IOCTL_OFF
+#undef FOPS_COMPAT_IOCTL_OFF
+#undef FOPS_MMAP_OFF
+#undef FOPS_OPEN_OFF
+#undef FOPS_RELEASE_OFF
+#undef FOPS_SPLICE_READ_OFF
+#undef FOPS_SHOW_FDINFO_OFF
+#undef CRED_UID_OFF
+#undef CRED_SECUREBITS_OFF
+#undef CRED_CAPS_OFF
+#undef CRED_SECURITY_OFF
+#undef SKB_DATA_DELTA
+#undef MM_STRUCT_SZ
+
+#define KIMAGE_TEXT_BASE    _RSO_64(kimage_text_base, 0xffffffc080000000ULL)
+#define VMEMMAP_START       _RSO_64(vmemmap_start, 0xfffffffe00000000ULL)
+#define STRUCT_SLAB_CACHE_OFF _RSO(page_slab_cache, 0x08)
+#define FOPS_IOCTL_OFF        _RSO(fops_ioctl, 0x48)
+#define FOPS_COMPAT_IOCTL_OFF _RSO(fops_compat_ioctl, 0x50)
+#define FOPS_MMAP_OFF         _RSO(fops_mmap, 0x58)
+#define FOPS_OPEN_OFF         _RSO(fops_open, 0x68)
+#define FOPS_RELEASE_OFF      _RSO(fops_release, 0x78)
+#define FOPS_SPLICE_READ_OFF  _RSO(fops_splice_read, 0xb8)
+#define FOPS_SHOW_FDINFO_OFF  _RSO(fops_show_fdinfo, 0xd8)
+#define CRED_UID_OFF        _RSO(cred_uid, 8)
+#define CRED_SECUREBITS_OFF _RSO(cred_securebits, 40)
+#define CRED_CAPS_OFF       _RSO(cred_caps, 48)
+#define CRED_SECURITY_OFF   _RSO(cred_security, 128)
+#define SKB_DATA_DELTA      ((int64_t)_RSO_64(skb_data_delta, (uint64_t)-0xe80LL))
+#define MM_STRUCT_SZ        _RSO(mm_struct_sz, 0x500)
+
+/* rt_mutex_waiter layout: 6.1 compact (0x58, packed wake_state+prio) vs the
+ * 6.6+ augmented layout (0x70) baked into target.h. */
+#define WAITER_COMPACT (active_offsets && active_offsets->waiter_compact)
+#undef FAKE_WAITER_PI_TREE_ENTRY_OFF
+#undef FAKE_WAITER_TASK_OFF
+#undef FAKE_WAITER_LOCK_OFF
+#undef FAKE_WAITER_WAKE_STATE_OFF
+#undef FAKE_WAITER_WW_CTX_OFF
+#define FAKE_WAITER_PI_TREE_ENTRY_OFF (WAITER_COMPACT ? 0x18 : 0x28)
+#define FAKE_WAITER_TASK_OFF          (WAITER_COMPACT ? 0x30 : 0x50)
+#define FAKE_WAITER_LOCK_OFF          (WAITER_COMPACT ? 0x38 : 0x58)
+#define FAKE_WAITER_WAKE_STATE_OFF    (WAITER_COMPACT ? 0x40 : 0x60)
+#define FAKE_WAITER_WW_CTX_OFF        (WAITER_COMPACT ? 0x50 : 0x68)
 
 #endif

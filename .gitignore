@@ -1,4 +1,5 @@
 /ghostlock
+/ksud*
 local.properties
 .gradle/
 .idea/
@@ -9,3 +10,4 @@ build/
 .DS_Store
 __pycache__
 /devices
+/logs

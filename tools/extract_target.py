@@ -497,7 +497,9 @@ SYMBOLS = {
 FUNCTIONS = {
     "off_configfs_read_iter": ("configfs_read_iter",),
     "off_configfs_bin_write_iter": ("configfs_bin_write_iter",),
-    "off_copy_splice_read": ("copy_splice_read",),
+    # 6.1 kernels have no copy_splice_read; generic_file_splice_read is the
+    # equivalent splice target there.
+    "off_copy_splice_read": ("copy_splice_read", "generic_file_splice_read"),
     "off_noop_llseek": ("noop_llseek",),
 }
 
@@ -584,8 +586,12 @@ def resolve_symbols(
     result: dict[str, int | None] = {}
     for name, (symbol,) in SYMBOLS.items():
         result[name] = unique(symbols, symbol)
-    for name, (symbol,) in FUNCTIONS.items():
-        result[name] = unique(symbols, symbol)
+    for name, symbols_for_field in FUNCTIONS.items():
+        result[name] = next(
+            (addr for sym in symbols_for_field
+             if (addr := unique(symbols, sym)) is not None),
+            None,
+        )
     result["off_slide_loggers_0_1"] = (
         unique(symbols, "loggers") + 0x10 if unique(symbols, "loggers") is not None else None
     )
@@ -870,6 +876,9 @@ def derive_pselect_layout(
     frames = {key: first_sp_frame(text, names[key]) for key, text in dis.items()}
 
     pi_tree = btf.field("rt_mutex_waiter", "pi_tree")
+    if pi_tree is None:
+        # 6.1 and earlier name this member pi_tree_entry.
+        pi_tree = btf.field("rt_mutex_waiter", "pi_tree_entry")
     wake_state = btf.field("rt_mutex_waiter", "wake_state")
     if pi_tree is None or wake_state is None:
         raise ExtractError("BTF rt_mutex_waiter.pi_tree/wake_state missing")
@@ -1148,7 +1157,11 @@ def resolve_structs(btf: Btf) -> dict[str, int | None]:
                 result[macro] = None
             continue
         for macro, field_name in fields.items():
-            result[macro] = btf.field(struct_name, field_name)
+            value = btf.field(struct_name, field_name)
+            if value is None and field_name in ("tree", "pi_tree"):
+                # 6.1 and earlier name these members tree_entry/pi_tree_entry.
+                value = btf.field(struct_name, field_name + "_entry")
+            result[macro] = value
     for macro, struct_name in (
         ("struct_page_size", "page"),
     ):

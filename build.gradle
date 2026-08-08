@@ -2,9 +2,24 @@ plugins {
     id 'com.android.application' version '9.3.1' apply false
 }
 
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.isFile()) {
+    localPropertiesFile.withInputStream { localProperties.load(it) }
+}
+
+def ghostlockNdk = localProperties.getProperty('ghostlock.ndk.dir')
+def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+def ghostlockMake = isWindows && ghostlockNdk
+        ? file("${ghostlockNdk}/prebuilt/windows-x86_64/bin/make.exe")
+        : 'make'
+
 tasks.register('buildGhostlockNative', Exec) {
     workingDir rootDir
-    commandLine 'make', 'ghostlock'
+    if (ghostlockNdk) {
+        environment 'NDK_ROOT', ghostlockNdk.replace('\\', '/')
+    }
+    commandLine ghostlockMake, 'ghostlock'
     inputs.files(
         fileTree('src') { include '**/*.c', '**/*.h' },
         file('Makefile')
@@ -12,9 +27,28 @@ tasks.register('buildGhostlockNative', Exec) {
     outputs.file(file('ghostlock'))
 }
 
+tasks.register('buildGhostlockHelperNative', Exec) {
+    workingDir rootDir
+    if (ghostlockNdk) {
+        environment 'NDK_ROOT', ghostlockNdk.replace('\\', '/')
+    }
+    commandLine ghostlockMake, 'helper'
+    inputs.files(
+        file('src/core/su_daemon.c'),
+        file('Makefile')
+    )
+    outputs.file(file('ghostlock-helper'))
+}
+
 tasks.register('prepareGhostlockJniLibs', Copy) {
     dependsOn('buildGhostlockNative')
     from('ghostlock')
     into('app/src/main/jniLibs/arm64-v8a')
     rename { 'libghostlock.so' }
+}
+
+tasks.register('prepareGhostlockPayloads', Copy) {
+    dependsOn('buildGhostlockHelperNative')
+    from('ghostlock-helper')
+    into('app/src/main/assets')
 }

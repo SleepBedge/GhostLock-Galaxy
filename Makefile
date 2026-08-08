@@ -15,10 +15,11 @@ endif
 SRCS := \
   src/core/main.c \
   src/core/util.c \
-  src/core/slide.c \
+  src/core/kaslr.c \
   src/core/fops.c \
   src/core/pipe.c \
-  src/core/root.c
+  src/core/root.c \
+  src/core/umh_helper.c
 
 # Device offsets are selected at runtime from uname -r.
 TARGET_CONFIG ?= target.h
@@ -27,9 +28,13 @@ CFLAGS = -O2 -Wall -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function 
   -Isrc/core -Isrc/devices -DTARGET_CONFIG_H=\"$(TARGET_CONFIG)\"
 LDFLAGS := -fPIE -pie -pthread
 
-.PHONY: all clean product
+.PHONY: all clean product helper
 
 all: ghostlock
+
+helper: src/core/su_daemon.c
+	@echo "Using NDK compiler: $(NDK_CC)"
+	$(NDK_CC) $(CFLAGS) $(LDFLAGS) $< -ldl -o ghostlock-helper
 
 ghostlock: $(SRCS)
 	@echo "Using NDK compiler: $(NDK_CC)"
@@ -41,4 +46,4 @@ product: ghostlock
 	@echo "构建 APK: .\gradlew.bat :app:assembleDebug"
 
 clean:
-	rm -f ghostlock
+	rm -f ghostlock ghostlock-helper

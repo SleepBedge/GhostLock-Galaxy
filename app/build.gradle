@@ -78,6 +78,10 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    buildFeatures {
+        aidl = true
+    }
+
     enableKotlin = false
 
     packaging {
@@ -87,7 +91,14 @@ android {
     }
 }
 
+dependencies {
+    def shizukuVersion = '13.1.5'
+    implementation "dev.rikka.shizuku:api:${shizukuVersion}"
+    implementation "dev.rikka.shizuku:provider:${shizukuVersion}"
+}
+
 tasks.named('preBuild') {
     dependsOn(rootProject.tasks.named('prepareGhostlockJniLibs'))
+    dependsOn(rootProject.tasks.named('prepareGhostlockPayloads'))
     dependsOn(tasks.named('generateSupportedKernels'))
 }
