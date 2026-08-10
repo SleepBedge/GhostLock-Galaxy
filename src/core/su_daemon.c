@@ -38,6 +38,29 @@
 
 static uid_t allowed_client_uid = 2000;
 
+static void trace_log(const char *format, ...);
+
+static void daemon_cleanup_socket(void) {
+  unlink(BOOTSTRAP_SOCK_PATH);
+}
+
+static void daemon_cleanup_signal(int signal_number) {
+  daemon_cleanup_socket();
+  _exit(128 + signal_number);
+}
+
+static void daemon_request_shutdown(pid_t daemon_pid, int status) {
+  if (daemon_pid <= 1 || daemon_pid == getpid()) {
+    return;
+  }
+  trace_log("[*] late-load request complete status=%d; stopping daemon pid=%d\n",
+            status, daemon_pid);
+  if (kill(daemon_pid, SIGTERM) != 0) {
+    trace_log("[!] daemon shutdown signal failed pid=%d errno=%d\n",
+              daemon_pid, errno);
+  }
+}
+
 #define SU_PROTOCOL_MAGIC 0x53553235U
 #define SU_PROTOCOL_VERSION 1U
 #define SU_RESPONSE_MAGIC 0x53555235U
@@ -486,7 +509,23 @@ static int stage_loader(const char *source_path) {
     unlink(STAGE_TMP_PATH);
     return 0;
   }
-  chmod(STAGE_PATH, 0755);
+  if (chmod(STAGE_PATH, 0755) != 0) {
+    trace_log("[!] stage chmod failed path=%s errno=%d\n", STAGE_PATH,
+              errno);
+    unlink(STAGE_PATH);
+    return 0;
+  }
+  struct stat stage_stat;
+  memset(&stage_stat, 0, sizeof(stage_stat));
+  int stage_stat_ok = stat(STAGE_PATH, &stage_stat) == 0;
+  if (!stage_stat_ok || !S_ISREG(stage_stat.st_mode) ||
+      (uint64_t)stage_stat.st_size != total) {
+    trace_log("[!] stage verify failed path=%s errno=%d bytes=%lld want=%llu\n",
+              STAGE_PATH, errno, (long long)stage_stat.st_size,
+              (unsigned long long)total);
+    unlink(STAGE_PATH);
+    return 0;
+  }
   trace_log("[*] stage refresh complete source=%s stage=%s bytes=%llu\n",
             source_path, STAGE_PATH, (unsigned long long)total);
   return 1;
@@ -669,7 +708,8 @@ static int run_fold6_late_load(struct su_request *request, int conn) {
       trace_log("[*] original late-load exec selected ksud-as-logcat pid=%d\n",
                 getpid());
       execl(LOGCAT_PATH, "logcat", "late-load", "--kmi", KSU_KMI,
-            "--package-name", "me.weishu.kernelsu", (char *)NULL);
+            "--package-name", "me.weishu.kernelsu", "--allow-shell",
+            (char *)NULL);
       trace_log("[!] original late-load exec failed path=%s errno=%d\n",
                 LOGCAT_PATH, errno);
       dprintf(STDERR_FILENO, "late-load: exec: %s\n", strerror(errno));
@@ -1003,6 +1043,7 @@ static int get_peer_cred(int conn, struct ucred *peer) {
 }
 
 static void serve_one(int conn) {
+  pid_t daemon_pid = getppid();
   struct ucred peer = {0};
   trace_log("[*] serve connection begin conn=%d\n", conn);
   if (!get_peer_cred(conn, &peer) || peer.uid != allowed_client_uid) {
@@ -1043,6 +1084,7 @@ static void serve_one(int conn) {
 
   int is_kernelsu_late_load = request.header.argc == 2 &&
                               strcmp(request.argv[1], "--late-load") == 0;
+  int is_one_shot_shell = request.header.argc == 1;
   trace_log("[*] serve request decoded argc=%u envc=%u interactive=%u late_load=%d\n",
             request.header.argc, request.header.envc,
             request.header.interactive, is_kernelsu_late_load);
@@ -1053,11 +1095,18 @@ static void serve_one(int conn) {
                          : run_direct(&request, conn);
   trace_log("[*] serve request complete status=%d\n", status);
   send_response(conn, status);
+  if (is_kernelsu_late_load || is_one_shot_shell) {
+    daemon_request_shutdown(daemon_pid, status);
+  }
   free_request(&request);
 }
 
 static int daemon_main(void) {
   signal(SIGPIPE, SIG_IGN);
+  signal(SIGTERM, daemon_cleanup_signal);
+  signal(SIGINT, daemon_cleanup_signal);
+  signal(SIGHUP, daemon_cleanup_signal);
+  atexit(daemon_cleanup_socket);
   set_root_env();
   trace_log("[*] daemon start uid=%d euid=%d allowed_uid=%d\n", getuid(),
             geteuid(), allowed_client_uid);

