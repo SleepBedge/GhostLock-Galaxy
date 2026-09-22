@@ -1,9 +1,9 @@
 /* Image-derived candidate for Samsung SM-F956U1 / F956U1UES4DZG3.
  *
  * Extracted from the exact AP boot.img and xbl_config.elf on 2026-09-22
- * with tools/extract_target.py and LLVM 22.1.8.  The phone is disconnected,
- * so this entry has not yet been checked against live uname/tracefs output or
- * a debug payload run.  Keep tracefs_leak enabled so a future run aborts if
+ * with tools/extract_target.py and LLVM 22.1.8.  The connected phone reports
+ * the matching uname release and tracefs event metadata; the debug payload
+ * path has not been run.  Keep tracefs_leak enabled so a future run aborts if
  * the leak metadata does not match instead of guessing a KASLR slide.
  */
 
