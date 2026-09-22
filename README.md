@@ -13,8 +13,43 @@ and code path should not be assumed to be interchangeable with this project.
 | Device | Kernel |
 | ------ | ------ |
 | Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
+| Samsung Galaxy Z Fold6 (SM-F956U1) | `F956U1UES4DZG3` — offsets pending exact AP image |
 
 At startup the kernel is matched against the offset table via `uname -r`; unsupported kernels are rejected immediately.
+
+### SM-F956U1 porting status
+
+`SM-F956U1` is a separate target even though it is the same Fold6 family. Do
+not copy the `SM-F9560` offsets until the complete kernel image has been
+compared or the target has been extracted and validated. The firmware build
+identifier alone is not enough to establish binary identity across regional
+variants.
+
+The required inputs are the AP package for `F956U1UES4DZG3`, especially:
+
+- `boot.img.lz4`, decompressed to `boot.img`;
+- `xbl_config.img.lz4`, decompressed to `xbl_config.img`; and
+- a matching `kallsyms` source, plus `llvm-objdump` from the Android NDK when
+  automatic disassembly is available.
+
+Keep the firmware archive and extracted images outside Git. Once those inputs
+are available, generate a candidate target header with:
+
+```powershell
+python tools/extract_target.py `
+  boot.img `
+  --xbl-config xbl_config.img `
+  --kallsyms kallsyms.txt `
+  --device f956u1-ues4dzg3
+```
+
+If `llvm-objdump.exe` is not already on `PATH`, add
+`--llvm-objdump <path-to-llvm-objdump.exe>` so the script can derive the
+disassembly-dependent fields instead of using its fallback heuristic.
+
+The generated entry must be reviewed against the device's live `uname -r`,
+the extractor report, and a debug build before use. The original `SM-F9560`
+entry remains unchanged until the new target is independently validated.
 
 ## Quick Start
 
