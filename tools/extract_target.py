@@ -110,7 +110,16 @@ def recover_kernel_phys_load(path: Path) -> int:
                     node = stack.pop()
                     props = node["props"]
                     assert isinstance(props, dict)
-                    label = props.get("mem-label", b"").split(b"\0", 1)[0].decode("ascii")
+                    # Qualcomm XBL DTBs normally use ``mem-label``.  Some
+                    # Samsung builds retain the firmware-facing ``MemLabel``
+                    # spelling instead, while keeping the same memory-map
+                    # nodes and cell layout.
+                    label_raw = next(
+                        (value for key, value in props.items()
+                         if key.lower().replace("_", "-") in {"mem-label", "memlabel"}),
+                        b"",
+                    )
+                    label = label_raw.split(b"\0", 1)[0].decode("ascii")
                     reg = props.get("reg")
                     if "/memorymap/" in str(node["path"]) and label in {"NOMAP", "Kernel"} and reg is not None:
                         ac, sc = int(node["parent_ac"]), int(node["parent_sc"])

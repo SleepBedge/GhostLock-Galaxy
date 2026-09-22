@@ -13,7 +13,7 @@ and code path should not be assumed to be interchangeable with this project.
 | Device | Kernel |
 | ------ | ------ |
 | Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
-| Samsung Galaxy Z Fold6 (SM-F956U1) | `F956U1UES4DZG3` — offsets pending exact AP image |
+| Samsung Galaxy Z Fold6 (SM-F956U1) | `6.1.145-android14-11-33418572-abF956USQS4DZG3` — image-derived candidate; live validation pending |
 
 At startup the kernel is matched against the offset table via `uname -r`; unsupported kernels are rejected immediately.
 
@@ -25,10 +25,14 @@ compared or the target has been extracted and validated. The firmware build
 identifier alone is not enough to establish binary identity across regional
 variants.
 
-The required inputs are the AP package for `F956U1UES4DZG3`, especially:
+The exact AP package has now been extracted outside Git. The candidate is in
+`src/devices/f956u1-ues4dzg3/offsets.h`; it still requires live validation.
+For reproducibility, the relevant inputs are the AP package for
+`F956U1UES4DZG3`, especially:
 
 - `boot.img.lz4`, decompressed to `boot.img`;
-- `xbl_config.img.lz4`, decompressed to `xbl_config.img`; and
+- `xbl_config.img.lz4`, decompressed to the XBL configuration image (the
+  extracted copy used here is named `xbl_config.elf`); and
 - a matching `kallsyms` source, plus `llvm-objdump` from the Android NDK when
   automatic disassembly is available.
 

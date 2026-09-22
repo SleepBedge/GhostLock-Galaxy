@@ -94,6 +94,7 @@ struct kernel_offsets {
 static const struct kernel_offsets known_offsets[] = {
 /* Add a new verified device by creating src/devices/<name>/offsets.h. */
 #include "zfold6/offsets.h"
+#include "f956u1-ues4dzg3/offsets.h"
   { .uname_r = NULL }
 };
 
