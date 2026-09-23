@@ -330,6 +330,67 @@ static atomic_int gk_t1_about_wait, gk_t1_done, gk_t1_timeout;
 static atomic_int gk_edeadlk, gk_release, gk_owner_has_lock;
 static atomic_int gk_waiter_tid, gk_fire_count;
 
+/* The route timestamp is published immediately before entering pselect6.
+ * A scheduler delay at that point used to let the consumer punch before the
+ * kernel had copied the fd sets onto its stack, which turns a timing miss into
+ * a kernel crash.  Confirm the waiter is in do_select for several samples
+ * before issuing the one destructive sched_setattr operation. */
+static long read_task_syscall_nr(int tid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  char buf[128];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return -1;
+  buf[n] = 0;
+  char *end = NULL;
+  errno = 0;
+  long nr = strtol(buf, &end, 0);
+  return (errno || end == buf) ? -1 : nr;
+}
+
+static int read_task_wchan(int tid, char *buf, size_t size) {
+  if (!buf || size < 2) return 0;
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan", tid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 0;
+  ssize_t n = read(fd, buf, size - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  buf[n] = 0;
+  char *newline = strchr(buf, '\n');
+  if (newline) *newline = 0;
+  return 1;
+}
+
+static int task_blocked_in_pselect(int tid, char *wchan, size_t wchan_size) {
+  if (read_task_syscall_nr(tid) != SYS_pselect6 ||
+      !read_task_wchan(tid, wchan, wchan_size)) {
+    return 0;
+  }
+  return strncmp(wchan, "do_select", strlen("do_select")) == 0;
+}
+
+static int wait_for_pselect_blocked(int tid, int timeout_usec,
+                                    int confirmations, char *last_wchan,
+                                    size_t last_wchan_size) {
+  uint64_t deadline = mono_ns() + (uint64_t)timeout_usec * 1000ULL;
+  int synced = 0;
+  while (mono_ns() < deadline) {
+    if (task_blocked_in_pselect(tid, last_wchan, last_wchan_size)) {
+      if (++synced >= confirmations) return 1;
+      usleep(100);
+    } else {
+      synced = 0;
+      __asm__ volatile("yield" ::: "memory");
+    }
+  }
+  return 0;
+}
+
 static void *sync_waiter_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
   atomic_store(&gk_waiter_tid, (int)syscall(SYS_gettid));
@@ -426,6 +487,14 @@ static void *sync_consumer_thread(void *arg __attribute__((unused))) {
     while (!(enter = atomic_load(&gk_enter_ts))) {
       if (atomic_load(&gk_route_done)) return NULL;
       __asm__ volatile("yield" ::: "memory");
+    }
+    char wchan[64] = "<unreadable>";
+    if (!wait_for_pselect_blocked(atomic_load(&gk_waiter_tid), 20000, 3,
+                                  wchan, sizeof(wchan))) {
+      pr_info("sync pselect blocked guard failed tid=%d wchan=%s; "
+              "skipping punch\n", atomic_load(&gk_waiter_tid), wchan);
+      atomic_store(&gk_route_done, 1);
+      return NULL;
     }
     uint64_t target = enter + (uint64_t)delay_usec * 1000ULL;
     /* Sleep to 1ms before the mark, then busy-wait the last ~2ms. */

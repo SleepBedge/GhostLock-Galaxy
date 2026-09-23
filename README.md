@@ -13,7 +13,7 @@ and code path should not be assumed to be interchangeable with this project.
 | Device | Kernel |
 | ------ | ------ |
 | Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
-| Samsung Galaxy Z Fold6 (SM-F956U1) | `6.1.145-android14-11-33418572-abF956USQS4DZG3` — image-derived candidate; live validation pending |
+| Samsung Galaxy Z Fold6 (SM-F956U1) | `6.1.145-android14-11-33418572-abF956USQS4DZG3` |
 
 At startup the kernel is matched against the offset table via `uname -r`; unsupported kernels are rejected immediately.
 
@@ -26,7 +26,9 @@ identifier alone is not enough to establish binary identity across regional
 variants.
 
 The exact AP package has now been extracted outside Git. The candidate is in
-`src/devices/f956u1-ues4dzg3/offsets.h`; it still requires live validation.
+`src/devices/f956u1-ues4dzg3/offsets.h` and has been validated on a live
+`SM-F956U1` running this kernel: an app-driven run reaches KernelSU root
+without rebooting the device.
 For reproducibility, the relevant inputs are the AP package for
 `F956U1UES4DZG3`, especially:
 

