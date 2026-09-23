@@ -57,6 +57,46 @@ The generated entry must be reviewed against the device's live `uname -r`,
 the extractor report, and a debug build before use. The original `SM-F9560`
 entry remains unchanged until the new target is independently validated.
 
+## Changes in this fork
+
+This repository is a fork of
+[wxxsfxyzm/GhostLock-Galaxy](https://github.com/wxxsfxyzm/GhostLock-Galaxy).
+Relative to upstream `d082c2d`, the only functional change is the `SM-F956U1`
+target described above; the complete diff is kept as a single patch in
+[`docs/upstream-f956u1.patch`](docs/upstream-f956u1.patch), so it can be
+reviewed, applied, or proposed upstream as one unit. The patch does not contain
+`docs/upstream-f956u1.patch` itself.
+
+```bash
+git apply -p1 docs/upstream-f956u1.patch
+```
+
+Regenerate the patch from the upstream commit with:
+
+```bash
+git diff d082c2d -- . ':(exclude)docs/upstream-f956u1.patch' > docs/upstream-f956u1.patch
+```
+
+Contents of the patch:
+
+- `src/devices/f956u1-ues4dzg3/offsets.h` adds the validated `SM-F956U1` /
+  `F956U1UES4DZG3` target, and `src/devices/offsets.h` registers it.
+- `src/core/main.c` gates the destructive `sched_setattr` punch behind
+  `wait_for_pselect_blocked`. The route publishes its timestamp immediately
+  before entering `pselect6`, so a scheduler delay at that point used to let
+  the consumer punch before the kernel had copied the fd sets onto its stack,
+  which turned an ordinary timing miss into a reboot.
+- `src/core/main.c` replaces the persisted punch-delay rotation with a sticky
+  selection. A wrong delay corrupts the PI chain on this target instead of
+  merely missing the window, so the last delay that produced a verified write
+  is reused and the search advances only after an attempt that failed to
+  confirm. An attempt records itself as in progress before firing, so a crash
+  also advances the search on the next boot.
+- `tools/extract_target.py` accepts Samsung's `MemLabel` device-tree spelling
+  next to Qualcomm's `mem-label` when recovering the XBL memory map.
+- This README documents the target. Porting details, the live validation, and
+  the four corrected offset fields are described above.
+
 ## Quick Start
 
 For the APK path, start Shizuku through wireless debugging, grant GhostLock permission, and tap **Run**. Shizuku starts the payload as the Android shell user; the APK itself is not the exploit execution context.

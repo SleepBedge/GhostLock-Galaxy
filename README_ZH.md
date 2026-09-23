@@ -12,8 +12,34 @@
 | 设备 | Kernel |
 | ---- | ------ |
 | Samsung Galaxy Z Fold6（SM-F9560 / q6q） | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
+| Samsung Galaxy Z Fold6（SM-F956U1） | `6.1.145-android14-11-33418572-abF956USQS4DZG3` |
 
 启动时按 `uname -r` 精确匹配 offset 表，未匹配的内核会直接拒绝运行。
+
+## 本仓库相对上游的改动
+
+本仓库 fork 自 [wxxsfxyzm/GhostLock-Galaxy](https://github.com/wxxsfxyzm/GhostLock-Galaxy)。
+相对上游 `d082c2d`，功能性改动只有 `SM-F956U1` 目标；全部差异以单个补丁保存在
+[`docs/upstream-f956u1.patch`](docs/upstream-f956u1.patch)，便于一次性审阅、应用，
+或在将来直接向上游提交。该补丁本身不包含 `docs/upstream-f956u1.patch`。
+
+```bash
+git apply -p1 docs/upstream-f956u1.patch
+```
+
+补丁内容：
+
+- 新增并注册已在真机验证的 `SM-F956U1` / `F956U1UES4DZG3` 目标
+  （`src/devices/f956u1-ues4dzg3/offsets.h`、`src/devices/offsets.h`）。
+- `src/core/main.c` 在确认已进入 `pselect6` 阻塞后才触发破坏性的
+  `sched_setattr`，避免调度延迟导致内核在复制 fd 集合之前就被 punch，
+  把普通的超时失误变成重启。
+- `src/core/main.c` 将持久化的 punch delay 轮换改为粘性选择：只复用已验证写入
+  成功的延迟，未确认成功（含重启）才推进；触发前会先标记为进行中，
+  因此崩溃后下一次启动也会继续推进搜索。
+- `tools/extract_target.py` 额外兼容 Samsung 设备树的 `MemLabel` 拼写
+  （原先只认 Qualcomm 的 `mem-label`）。
+- README 记录该移植。移植细节、真机验证结果以及修正的四个 offset 字段见上文。
 
 ## 快速开始
 

